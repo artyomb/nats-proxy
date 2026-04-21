@@ -1,0 +1,8 @@
+.env.local
+/dev/
+*.css.map
+AGENTS.md
+src/.bundle/
+.idea/
+**/.knowledge/
+.codex
