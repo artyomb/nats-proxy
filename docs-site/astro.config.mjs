@@ -17,26 +17,9 @@ export default defineConfig({
 			},
 			sidebar: [
 				{
-					label: 'Start Here',
+					label: 'Docs',
 					items: [
-						{ label: 'Getting Started', slug: 'getting-started' },
-						{ label: 'Example Walkthroughs', slug: 'guides/examples' },
-					],
-				},
-				{
-					label: 'Guides',
-					items: [
-						{ label: 'Execution Model', slug: 'guides/execution-model' },
-						{ label: 'Await External Work', slug: 'guides/await' },
-						{ label: 'Barrier Joins', slug: 'guides/joins' },
-						{ label: 'Dynamic Goto', slug: 'guides/goto' },
-					],
-				},
-				{
-					label: 'Reference',
-					items: [
-						{ label: 'Runtime API', slug: 'reference/runtime-api' },
-						{ label: 'Tokens and Joins', slug: 'reference/tokens-and-joins' },
+						{ label: 'Hello', slug: 'hello' },
 					],
 				},
 			],
