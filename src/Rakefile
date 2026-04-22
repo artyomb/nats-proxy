@@ -1,14 +1,39 @@
 require 'rspec/core/rake_task'
+require 'fileutils'
 
-RSpec::Core::RakeTask.new(:spec)
+def reset_coverage_artifacts
+  FileUtils.rm_f("coverage/.resultset.json")
+  FileUtils.rm_f("coverage/.resultset.json.lock")
+  FileUtils.rm_f("coverage/.last_run.json")
+end
 
-task default: :rspec
+RSpec::Core::RakeTask.new(:spec) do |task|
+  task.pattern = "spec/**/*_spec.rb"
+end
+
+namespace :spec do
+  RSpec::Core::RakeTask.new(:contracts) do |task|
+    task.pattern = "spec/contracts/**/*_spec.rb"
+  end
+
+  RSpec::Core::RakeTask.new(:unit) do |task|
+    task.pattern = "spec/unit/**/*_spec.rb"
+  end
+
+  RSpec::Core::RakeTask.new(:system) do |task|
+    task.pattern = "spec/system/**/*_spec.rb"
+  end
+end
+
+task default: :spec
 
 desc "Run all tests"
 task :test => :spec
 
 desc "Run tests with coverage"
 task :coverage do
-  ENV['COVERAGE'] = 'true'
+  ENV['COVERAGE_GATE'] = '1'
+  ENV['SIMPLECOV_COMMAND_NAME'] = 'rspec-full'
+  reset_coverage_artifacts
   Rake::Task[:spec].invoke
 end

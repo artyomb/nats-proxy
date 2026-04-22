@@ -1,0 +1,78 @@
+services:
+  proxy-gateway-requester:
+    image: <registry>/<image>:<tag>
+    container_name: proxy-gateway-requester
+    restart: unless-stopped
+
+    environment:
+      # Service role.
+      SERVICE_ROLE: requester
+      SERVICE_ID: <requester_service_id>
+      PORT: 7000
+      RACK_ENV: production
+
+      # Gateway service -> local embedded NATS connection.
+      NATS_URL: nats://127.0.0.1:4222
+      NATS_MODE: jetstream
+      NATS_STREAM: <stream_name>
+      NATS_CONSUMER_NAME: <requester_consumer_name>
+      NATS_REQUEST_SUBJECT_ROOT: <request_subject_root>
+      NATS_RESPONSE_SUBJECT_ROOT: <response_subject_root>
+
+      # Optional override, otherwise entrypoint resolves from EMBEDDED_NATS_JS_DOMAIN or $JS.API.
+      NATS_JS_API_PREFIX: ""
+
+      # Bridge timeouts.
+      NATS_RESPONSE_TIMEOUT: 30
+      STREAM_RESPONSE_TIMEOUT: 30
+
+      # Optional local SOCKS5 ingress on requester.
+      SOCKS5_ENABLED: "false"
+      SOCKS5_LISTEN_HOST: 0.0.0.0
+      SOCKS5_LISTEN_PORT: 1080
+
+      # Optional proxy auth for requester ingress.
+      PROXY_AUTH_ENABLED: "true"
+      PROXY_AUTH_USERS_JSON: '{"<user>":"<bcrypt_hash>"}'
+
+      # Embedded NATS enabled with generated config.
+      EMBEDDED_NATS_ENABLED: "true"
+      EMBEDDED_NATS_GENERATE_CONFIG: "true"
+      EMBEDDED_NATS_GENERATED_CONFIG_PATH: /data/nats.conf
+
+      # Usually disabled on requester to avoid owning stream state.
+      EMBEDDED_NATS_JETSTREAM_ENABLED: "false"
+      EMBEDDED_NATS_JETSTREAM_STORE_DIR: /data
+      EMBEDDED_NATS_JS_DOMAIN: ""
+
+      # Local leaf listener on requester (for symmetry/future topologies).
+      EMBEDDED_NATS_LEAF_LISTEN_HOST: 0.0.0.0
+      EMBEDDED_NATS_LEAF_LISTEN_PORT: 7422
+      EMBEDDED_NATS_LEAF_USER: <requester_leaf_local_user>
+      EMBEDDED_NATS_LEAF_PASSWORD: <requester_leaf_local_password>
+
+      # Remote receiver leaf endpoint.
+      LEAF_REMOTE_HOST: <receiver_public_host_or_ip>
+      LEAF_REMOTE_PORT: 7422
+
+      # Select exactly one auth mode for requester -> receiver leaf remote:
+      # 1) user/password mode:
+      LEAF_REMOTE_USER: <receiver_leaf_user>
+      LEAF_REMOTE_PASSWORD: <receiver_leaf_password>
+      # 2) nkey mode (leave LEAF_REMOTE_USER/PASSWORD empty):
+      LEAF_REMOTE_NKEY: ""
+
+      # Readiness tuning for embedded NATS checks.
+      EMBEDDED_NATS_READY_RETRIES: 40
+      EMBEDDED_NATS_READY_SLEEP_SEC: 1
+
+    ports:
+      - "7000:7000"
+      - "1080:1080"
+      - "4222:4222"
+
+    volumes:
+      - requester-data:/data
+
+volumes:
+  requester-data:

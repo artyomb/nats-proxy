@@ -1,7 +1,26 @@
 on: { push: { branches: [main,release,dev] } }
 
 jobs:
+  test_service_image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: ruby/setup-ruby@v1
+        with: { ruby-version: 3.4.4 }
+      - run: gem install build-labels
+      - run: env && cd docker && build-labels -n -c docker-compose.yml $(if [ "${GITHUB_REF##*/}" = "release" ]; then echo "--full-version"; fi) github set_version to_dockerfiles to_compose | tee bake.yml
+        env:
+          GITHUB_RUN_NUMBER: ${{ github.run_number }}
+      - run: docker buildx bake -f bake.yml --load tests
+        env: { REGISTRY_HOST: 'dtorry' }
+        working-directory: ./docker
+      - run: docker compose -f bake.yml run --rm tests
+        env: { REGISTRY_HOST: 'dtorry' }
+        working-directory: ./docker
+
   build_service_images:
+    needs: [test_service_image]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v3
@@ -9,7 +28,7 @@ jobs:
         with: { username: '${{ secrets.DOCKER_HUB_LOGIN }}', password: '${{ secrets.DOCKER_HUB_PASSWORD }}' }
       - uses: docker/setup-buildx-action@v3
       - uses: ruby/setup-ruby@v1
-        with: { ruby-version: 3.3.2 }
+        with: { ruby-version: 3.4.4 }
       - run: gem install build-labels
       - run: env && cd docker && build-labels -n -c docker-compose.yml $(if [ "${GITHUB_REF##*/}" = "release" ]; then echo "--full-version"; fi) github set_version to_dockerfiles to_compose | tee bake.yml
         env:

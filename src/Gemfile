@@ -12,6 +12,11 @@ gem 'rackup', '~> 2.2.1'
 gem 'falcon'
 
 gem 'stack-service-base'
+gem 'nats-async'
+gem 'faraday'
+gem 'faraday-retry'
+gem 'async-http-faraday'
+gem 'bcrypt'
 
 group :test do
   gem 'sqlite3'
