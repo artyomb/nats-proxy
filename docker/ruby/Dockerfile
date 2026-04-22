@@ -18,8 +18,7 @@ ENV RACK_ENV=production NODE_ENV=production
 RUN rake -T | grep 'rake build' && rake build || echo 'no build task'
 
 FROM base AS tests
-# COPY . . required test fixtures
-CMD bundle exec rspec
+RUN bundle exec rspec
 
 FROM ruby:3.4.4-slim-bookworm AS deploy
 ARG NATS_SERVER_VERSION=2.11.6
@@ -50,8 +49,8 @@ COPY --from=base /usr/local/bundle /usr/local/bundle
 COPY --from=docker /ruby/entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
 
-# Force start & wait test Stage
-# COPY --from=tests /app/src/spec/results /app/src/spec/results
+# Force deploy stage to depend on successful test stage completion.
+COPY --from=tests /app/spec/results /app/spec/results
 
 COPY . /app
 

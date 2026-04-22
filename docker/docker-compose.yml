@@ -11,16 +11,3 @@ services:
         - type=gha,scope=natsproxy
       cache_to:
         - type=gha,scope=natsproxy,mode=max
-
-  tests:
-    image: ${REGISTRY_HOST}/nats-proxy-tests
-    build:
-      context: ../src
-      additional_contexts:
-        docker: ../docker
-      dockerfile: ../docker/ruby/Dockerfile
-      target: tests
-      cache_from:
-        - type=gha,scope=natsproxy
-      cache_to:
-        - type=gha,scope=natsproxy,mode=max
