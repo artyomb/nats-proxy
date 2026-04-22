@@ -80,42 +80,6 @@ SERVICE_RUNTIME = ServiceRuntime.new(
 )
 OBSERVABILITY_COLLECTOR = SERVICE_RUNTIME.collector
 
-module AsyncWarmup
-  class << self
-    def install!(&boot_callback)
-      @boot_callback = boot_callback
-      return if ENV['APP_ENV'] == 'test'
-      return if @installed
-
-      Async::Task.prepend Hook
-      @installed = true
-    end
-
-    def boot_once(parent_task)
-      return if @boot_started
-
-      @boot_started = true
-      parent_task.async(annotation: 'service-bootstrap') do |task|
-        @boot_callback&.call(task)
-      rescue => e
-        $stderr.puts 'Bootstrapping failed:'
-        $stderr.puts e.message, e.backtrace.join("\n")
-      end
-    end
-  end
-
-  module Hook
-    def initialize(...)
-      super
-      return unless @parent.is_a?(Async::Reactor)
-
-      AsyncWarmup.boot_once(self)
-    end
-  end
-end
-
-AsyncWarmup.install! { |task| SERVICE_RUNTIME.boot_once(task) }
-
 module RuntimeResponses
   module_function
 
@@ -135,6 +99,23 @@ module RuntimeResponses
     [503, { 'content-type' => 'application/json', 'content-length' => body.bytesize.to_s }, [body]]
   end
 end
+
+module AsyncWarmup
+  def initialize(...)
+    super(...)
+    return unless @parent.is_a?(Async::Reactor)
+
+    self.async(annotation: 'service-bootstrap') do |task|
+      SERVICE_RUNTIME.boot_once(task)
+    rescue => e
+      $stderr.puts 'Bootstrapping failed:'
+      $stderr.puts e.message, e.backtrace.join("\n")
+      raise
+    end
+  end
+end
+
+Async::Task.prepend AsyncWarmup unless ENV['APP_ENV'] == 'test'
 
 class ConnectProxyMiddleware
   def initialize(app, runtime_resolver:, proxy_auth:)
