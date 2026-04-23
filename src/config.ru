@@ -108,8 +108,7 @@ module AsyncWarmup
     self.async(annotation: 'service-bootstrap') do |task|
       SERVICE_RUNTIME.boot_once(task)
     rescue => e
-      $stderr.puts 'Bootstrapping failed:'
-      $stderr.puts e.message, e.backtrace.join("\n")
+      LOGGER.warn 'Bootstrapping failed:', e
       raise
     end
   end
