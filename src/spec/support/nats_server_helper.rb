@@ -227,7 +227,8 @@ module NatsServerHelper
             { user: "#{local_user}", password: "#{local_password}" }
           ]
           exports: [
-            { stream: "to.proxy.>" }
+            { stream: "to.proxy.requests.>" }
+            { stream: "to.proxy.sessions.upstream.>" }
             { service: "_INBOX.>", accounts: [proxy] }
           ]
           imports: [
@@ -249,7 +250,8 @@ module NatsServerHelper
             { service: "$JS.ACK.>", accounts: [local] }
           ]
           imports: [
-            { stream: { account: local, subject: "to.proxy.>" }, to: "proxy.>" }
+            { stream: { account: local, subject: "to.proxy.requests.>" }, to: "proxy.requests.>" }
+            { stream: { account: local, subject: "to.proxy.sessions.upstream.>" }, to: "proxy.sessions.upstream.>" }
             { service: { account: local, subject: "_INBOX.>" }, to: "_INBOX.>" }
           ]
           jetstream: enabled
