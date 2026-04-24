@@ -1,219 +1,289 @@
-# HTTP-to-NATS Proxy Gateway
+# nats-proxy
 
-This service is a Ruby HTTP-to-NATS bridge.
+`nats-proxy` is a Ruby proxy gateway that moves HTTP and TCP proxy traffic through NATS.
 
-Self NATS deployment docs:
-- EN: [`src/docs/self-nats/README.md`](src/docs/self-nats/README.md)
+The service is built for split-network deployments where the caller can reach a local proxy, the target service is reachable only from another node, and the two sides can communicate through NATS. One container image runs in one of two roles:
 
-One image supports two runtime roles:
-- `requester`: accepts HTTP, publishes a request envelope to NATS, waits for response events, returns HTTP to the caller.
-- `receiver`: consumes bridge requests from NATS, proxies them to `UPSTREAM_URL`, publishes response events, and also serves direct HTTP to the same upstream.
+| Role | Responsibility |
+|---|---|
+| `requester` | Accepts local HTTP, HTTP proxy, `CONNECT`, and optional SOCKS5 traffic, publishes bridge requests to NATS, and reconstructs responses for the client. |
+| `receiver` | Consumes bridge requests from NATS, connects to `UPSTREAM_URL` or a requested TCP target, and publishes response/session events back to the requester. |
 
-## Bridge flow
+Detailed documentation: <https://artyomb.github.io/nats-proxy/>
+
+---
+
+## Concept
+
+The core idea is a role-based proxy bridge. The requester is placed close to clients or local services. The receiver is placed close to the upstream system. The only required path between the two sides is NATS.
+
+Common requester placement options:
+
+```mermaid
+flowchart LR
+  subgraph workstation["Local workstation"]
+    tool["Tool / browser / SDK"]
+    requester_local["nats-proxy requester"]
+    tool -->|localhost proxy| requester_local
+  end
+
+  subgraph gateway["Gateway server"]
+    requester_gateway["nats-proxy requester"]
+  end
+
+  subgraph app_stack["Application stack"]
+    service_a["Service A"]
+    service_b["Service B"]
+    requester_stack["nats-proxy requester"]
+    service_a -->|local proxy| requester_stack
+    service_b -->|local proxy| requester_stack
+  end
+
+  subgraph transport["NATS transport"]
+    nats[("NATS / leafnode")]
+  end
+
+  subgraph remote_stack["Remote stack"]
+    receiver["nats-proxy receiver"]
+    upstream["Upstream service / TCP target"]
+    receiver --> upstream
+  end
+
+  tool -. network proxy .-> requester_gateway
+  requester_local --> nats
+  requester_gateway --> nats
+  requester_stack --> nats
+  nats --> receiver
+```
+
+Traffic always follows the same high-level path after it reaches requester:
 
 ```mermaid
 sequenceDiagram
-    participant Client as HTTP Client
-    participant Req as Requester role SERVICE_ROLE requester
-    participant N as NATS backend core or jetstream
-    participant Rec as Receiver role SERVICE_ROLE receiver
-    participant Up as Upstream HTTP Service
+  participant Caller as Client or local service
+  participant Req as nats-proxy requester
+  participant NATS as NATS transport
+  participant Rec as nats-proxy receiver
+  participant Up as Remote stack / upstream
 
-    Client->>Req: HTTP request
-    Note over Req,N: publish to request_root.requests.SERVICE_ID.request_id
-    Req->>N: request envelope + reply_to
-    N->>Rec: consume LISTEN_SUBJECT
-    Rec->>Up: proxy HTTP request
-    Up-->>Rec: status headers body
-    Note over Rec,N: publish to response_root.responses.SERVICE_ID.request_id
-    Rec->>N: response events
-    N->>Req: deliver response events
-    Req-->>Client: HTTP response buffered or streaming
-
-    opt direct HTTP path
-      Client->>Rec: HTTP request bypass bridge
-      Rec->>Up: direct proxy
-      Up-->>Rec: direct response
-      Rec-->>Client: HTTP response
-    end
+  Caller->>Req: HTTP / proxy / CONNECT / SOCKS5
+  Req->>NATS: bridge request or TCP session frames
+  NATS->>Rec: deliver bridge traffic
+  Rec->>Up: upstream HTTP request or TCP connection
+  Up-->>Rec: upstream response or bytes
+  Rec-->>NATS: bridge response or session frames
+  NATS-->>Req: response traffic
+  Req-->>Caller: client response or tunnel bytes
 ```
 
-## Runtime model
+> [!NOTE]
+> The deployment can use a shared external NATS server, or the image can start an embedded `nats-server` and connect two sides with NATS leafnodes.
 
-### Role selection
+---
 
-- `SERVICE_ROLE=requester|receiver`
-- If `SERVICE_ROLE` is not set, role resolves by topology: `receiver` when `UPSTREAM_URL` is set, otherwise `requester`.
-- `requester` starts the response listener and downstream tunnel listener.
-- `receiver` starts the request listener and upstream tunnel listener.
+## Traffic Patterns
 
-### Upstream requirement
+`nats-proxy` currently supports these ingress patterns on the requester side:
 
-- `receiver` requires `UPSTREAM_URL` for direct HTTP proxying and bridged request execution.
-- In Core mode, missing upstream returns a bridged `503` response.
-- In JetStream mode, missing upstream is treated as a retryable processing failure (`nak`).
+- Plain HTTP forwarding: client sends HTTP to requester; receiver forwards to `UPSTREAM_URL`.
+- HTTP proxy forwarding: client sends absolute-form proxy requests through requester.
+- HTTP `CONNECT`: requester opens a bridged TCP session through NATS.
+- SOCKS5: optional requester listener that maps SOCKS5 `CONNECT` to the same TCP session bridge.
+- Streaming HTTP responses: SSE and NDJSON responses are forwarded as streams.
 
-## Transport modes
+---
 
-`NATS_MODE` is resolved once at startup and remains fixed for the process lifetime.
+## Capabilities
 
-### `core`
+- Core NATS and JetStream backends.
+- Binary-safe chunk transport using base64 when a response chunk is not valid UTF-8.
+- Best-effort stream cancellation when the downstream client disconnects.
+- Local observability UI and JSON APIs for flows, cases, metrics, and NATS runtime state.
+- Optional proxy authentication with bcrypt-hashed users for proxy-specific ingress.
 
-- Uses Core NATS publish/subscribe.
-- Receiver consumes via `LISTEN_SUBJECT` with queue group `NATS_QUEUE_GROUP`.
-- Delivery semantics: best-effort at-most-once.
+---
 
-### `jetstream`
+## Runtime Roles
 
-- Requires stream access on startup.
-- Receiver consumes via durable pull consumer `NATS_CONSUMER_NAME`.
-- Requester consumes response events via a response-scoped consumer derived from `SERVICE_ID`.
-- Message outcomes:
-  - success -> `ack`
-  - malformed request envelope -> publish `400` bridge error when possible, then `term`
-  - transient failure -> `nak`
-  - long processing -> periodic `in_progress`
+### requester
 
-### `auto`
+The requester is the client-facing side.
 
-- Tries JetStream first by stream availability.
-- Falls back to Core when JetStream is unavailable.
-- Resolved backend is exposed in `/observability/nats` as `backend`.
+It starts:
 
-## Subjects and protocol
+- response listener for per-request bridge responses;
+- downstream session listener for TCP tunnel bytes;
+- SOCKS5 listener when `SOCKS5_ENABLED=true`.
 
-### Subject roots
+For regular HTTP routes, it publishes a bridge request if NATS outbound listening is ready. If the process also has `UPSTREAM_URL`, it can fall back to direct upstream execution.
 
-- Request root: `NATS_REQUEST_SUBJECT_ROOT`
-- Response root: `NATS_RESPONSE_SUBJECT_ROOT`
+### receiver
 
-Per-request subjects:
-- request: `<request_root>.requests.<SERVICE_ID>.<request_id>`
-- response: `<response_root>.responses.<SERVICE_ID>.<request_id>`
-- cancel: same per-request request subject as request (`<request_root>.requests.<SERVICE_ID>.<request_id>`) with typed envelope `type=cancel`
+The receiver is the upstream-facing side.
 
-`LISTEN_SUBJECT` defaults to `<request_root>.requests.>`.
+It starts:
 
-### Response event protocol
+- request listener on `LISTEN_SUBJECT`;
+- upstream session listener for TCP tunnel bytes;
+- handlers for `http_request` and `tcp_stream` operations.
 
-Requester expects event-framed JSON only:
-- `response_start`
-- `response_chunk` (0..N)
-- `response_error` (optional)
-- `response_end`
+When the receiver is accessed directly over HTTP and `UPSTREAM_URL` is configured, it proxies directly to the upstream without using NATS.
 
-```mermaid
-sequenceDiagram
-    participant Client as HTTP Client
-    participant Req as Requester
-    participant N as NATS Core or JetStream
-    participant Rec as Receiver
-    participant Up as Upstream HTTP Service
+If `SERVICE_ROLE` is not set, the service chooses `receiver` when `UPSTREAM_URL` is present and `requester` otherwise.
 
-    Client->>Req: HTTP request
-    Req->>N: request envelope + reply_to
-    N->>Rec: bridge request
-    Rec->>Up: HTTP proxy request
-    Up-->>Rec: status/headers/body stream
+---
 
-    Rec->>N: response_start
-    loop 0..N chunks
-      Rec->>N: response_chunk
-    end
-    opt upstream fails after stream start
-      Rec->>N: response_error
-    end
-    Rec->>N: response_end
-    N->>Req: response events
+## NATS Transport
 
-    alt response_start.streaming = true
-      Req-->>Client: stream chunks SSE or NDJSON
-    else streaming = false
-      Req-->>Client: single HTTP response after response_end
-    end
+The service can run on Core NATS or JetStream:
+
+| Mode | Summary |
+|---|---|
+| `core` | Pub/sub transport with receiver queue groups. |
+| `jetstream` | Persistent stream transport with pull consumers and explicit acknowledgements. |
+| `auto` | Startup-time backend detection based on stream availability. |
+
+For embedded deployments, the runtime image can start `nats-server` inside the container and generate a leafnode configuration from environment variables. For external deployments, point both roles at an existing NATS topology with `NATS_URL`.
+
+---
+
+## Proxy Authentication
+
+Proxy authentication is enabled by default for proxy-specific ingress:
+
+- absolute-form HTTP proxy requests;
+- legacy proxy requests detected by proxy headers;
+- `CONNECT`;
+- SOCKS5 when enabled.
+
+Local observability and health routes are not proxy-authenticated.
+
+`PROXY_AUTH_USERS_JSON` must be a JSON object where keys are usernames and values are bcrypt hashes:
+
+```json
+{"alice":"$2a$12$..."}
 ```
 
-`response_start` contains HTTP status, headers, content type, and `streaming` flag.
+If proxy auth is enabled and the users JSON is missing or invalid, the service enters a safety lock and denies proxy-specific traffic with a generic `404 Not Found`.
 
-## HTTP behavior
+Set `PROXY_AUTH_ENABLED=false` to disable this guard.
 
-### Requester path (HTTP -> NATS -> HTTP)
-
-- Supports `GET`, `POST`, `PUT`, `PATCH`, `DELETE`, `OPTIONS`, `HEAD`.
-- `GET` and `HEAD` keep `/`, `/health`, `/healthcheck`, and `/observability*` as local endpoints unless explicitly treated as proxy requests.
-- Publishes request envelope with:
-  - `request_id`
-  - `method`
-  - `path`
-  - `headers`
-  - `body`
-  - `reply_to`
-
-### Receiver direct path (HTTP -> Upstream)
-
-- Supports the same HTTP methods.
-- Reuses the same proxy and response protocol logic as NATS-delivered work.
-
-### HTTP proxy, CONNECT, and SOCKS5
-
-- HTTP proxy requests can target absolute URLs through the requester role.
-- `CONNECT` is supported through bridged TCP sessions.
-- SOCKS5 ingress is optional and enabled via `SOCKS5_ENABLED=true`.
-- Proxy auth is controlled by `PROXY_AUTH_ENABLED` and `PROXY_AUTH_USERS_JSON`.
-
-### Streaming and errors
-
-- Streaming content types: `text/event-stream`, `application/x-ndjson`.
-- Requester streaming mode is driven by `response_start.streaming`.
-- Multi-value response headers are preserved, including repeated headers.
-- If upstream fails after stream start:
-  - SSE: `event: error`
-  - NDJSON: `{"error":"..."}`
-- If requester does not receive `response_start` within `NATS_RESPONSE_TIMEOUT`, it returns HTTP `504`.
-- After `response_start`, `STREAM_RESPONSE_TIMEOUT` is enforced as an idle timeout between protocol events (`response_chunk`, `response_end`, `response_error`).
-- If no next event arrives within `STREAM_RESPONSE_TIMEOUT` after `response_start`, requester ends by timeout. For streams this becomes an in-band timeout error; for non-stream responses it becomes HTTP `504`.
-
-### Stream cancel propagation
-
-An active streaming HTTP response that disconnects downstream is treated as a cancel for that request lifecycle. The requester publishes one typed cancel envelope to the same per-request request subject as the original bridge request. Message format: top-level `type=cancel`, `request_id`, and nested `cancel` object with JSON fields `request_id`, `service_id`, `reason`, `timestamp`.
-
-Cancellation is best-effort, not a hard kill guarantee:
-- duplicate or late cancel messages are ignored
-- upstream work is interrupted only when the current upstream call can still observe the cancel check
-- after cancel, at most one already-started `response_chunk` may slip through as a bounded tail
-
-The terminal outcome is recorded as `canceled`, distinct from `completed`, `timeout`, `upstream_error`, and `protocol_error`.
-
-## Key configuration
-
-| Variable | Default | Purpose |
-|---|---|---|
-| `SERVICE_ROLE` | `receiver` if `UPSTREAM_URL` is set, else `requester` | `requester` or `receiver` |
-| `UPSTREAM_URL` | — | Upstream HTTP base URL for receiver role |
-| `NATS_URL` | `nats://localhost:4222` | NATS server URL |
-| `NATS_MODE` | `auto` | `core`, `jetstream`, or `auto` |
-| `NATS_STREAM` | `proxy` | JetStream stream name |
-| `NATS_CONSUMER_NAME` | `nats-proxy` | Receiver durable consumer name |
-| `NATS_QUEUE_GROUP` | `NATS_CONSUMER_NAME` | Core receiver queue group |
-| `NATS_REQUEST_SUBJECT_ROOT` | `to.proxy` | Request subject root |
-| `NATS_RESPONSE_SUBJECT_ROOT` | `from.proxy` | Response subject root |
-| `LISTEN_SUBJECT` | `<request_root>.requests.>` | Receiver subscription scope |
-| `SERVICE_ID` | `srv-<random>` | Instance identifier |
-| `NATS_RESPONSE_TIMEOUT` | `30` | Timeout waiting for the first `response_start` |
-| `STREAM_RESPONSE_TIMEOUT` | `30` | Idle timeout between events after `response_start` |
-| `RECEIVER_MAX_INFLIGHT` | `20` | Receiver async dispatcher max concurrent jobs |
-| `NATS_JS_API_PREFIX` | — | Optional JetStream API prefix |
-| `SOCKS5_ENABLED` | `false` | Enables the local SOCKS5 server for bridged TCP sessions |
-| `SOCKS5_LISTEN_HOST` | `0.0.0.0` | SOCKS5 bind host |
-| `SOCKS5_LISTEN_PORT` | `1080` | SOCKS5 bind port |
-| `PROXY_AUTH_ENABLED` | `true` | Enables HTTP proxy and SOCKS5 authentication guard |
-| `PROXY_AUTH_USERS_JSON` | — | JSON object of username to bcrypt hash |
+---
 
 ## Observability
 
-Local observability endpoints:
-- `GET /observability` (UI)
-- `GET /observability/flows`
-- `GET /observability/cases`
-- `GET /observability/metrics`
-- `GET /observability/nats`
+The service exposes local observability endpoints:
+
+| Endpoint | Description |
+|---|---|
+| `GET /observability` | HTML UI for runtime health, NATS state, flow cases, and raw payload inspection. |
+| `GET /observability/flows` | Event feed. Supports filters such as `request_id`, `subject`, `event_type`, `outcome`, `from`, `to`, `limit`, and `include_nats_payload`. |
+| `GET /observability/cases` | Request/session case summaries reconstructed from recorded events. |
+| `GET /observability/metrics` | RPS, error/cancel rates, and reconstruction quality for a bounded window. |
+| `GET /observability/nats` | NATS connection snapshot and JetStream stream/consumer details when available. |
+| `GET /healthcheck` | Health endpoint provided by the Rack service base. |
+
+The in-memory observability collector keeps a bounded recent event history and is intended for local diagnosis, not long-term storage.
+
+---
+
+## Configuration
+
+The variables below are the minimum set needed to understand and start the service.
+
+| Variable | Default | Description |
+|---|---|---|
+| `SERVICE_ROLE` | `receiver` if `UPSTREAM_URL` is set, else `requester` | Runtime role: `requester` or `receiver`. |
+| `UPSTREAM_URL` | unset | Receiver HTTP upstream base URL. |
+| `PORT` | `7000` in the Docker image | Rack/Falcon bind port. |
+| `NATS_URL` | `nats://localhost:4222` | NATS server URL used by the app process. |
+| `NATS_MODE` | `auto` | `core`, `jetstream`, or `auto`. |
+| `PROXY_AUTH_ENABLED` | `true` | Enables proxy auth guard for proxy-specific traffic. |
+| `PROXY_AUTH_USERS_JSON` | unset | JSON map of username to bcrypt hash. |
+| `SOCKS5_ENABLED` | `false` | Enables SOCKS5 listener on requester. |
+| `EMBEDDED_NATS_ENABLED` | `false` | Starts embedded `nats-server` from the runtime image. |
+
+---
+
+## Quick Start
+
+### Local Development
+
+Install Ruby dependencies from `src/`:
+
+```bash
+cd src
+bundle install
+```
+
+Start NATS separately, then run one receiver and one requester. Example with core NATS:
+
+```bash
+# terminal 1
+nats-server
+
+# terminal 2: receiver
+cd src
+SERVICE_ROLE=receiver \
+UPSTREAM_URL=http://127.0.0.1:8080 \
+NATS_URL=nats://127.0.0.1:4222 \
+NATS_MODE=core \
+PORT=7001 \
+bundle exec rackup -o 0.0.0.0 -p 7001 -s falcon
+
+# terminal 3: requester
+cd src
+SERVICE_ROLE=requester \
+NATS_URL=nats://127.0.0.1:4222 \
+NATS_MODE=core \
+PROXY_AUTH_ENABLED=false \
+PORT=7000 \
+bundle exec rackup -o 0.0.0.0 -p 7000 -s falcon
+```
+
+Send traffic to the requester:
+
+```bash
+curl -i http://127.0.0.1:7000/api/path
+curl -sS http://127.0.0.1:7000/observability/cases
+```
+
+### Docker Image
+
+Build the image through the repository compose file:
+
+```bash
+docker compose -f docker/docker-compose.yml build nats_proxy
+```
+
+For a two-node embedded NATS deployment, start the receiver first and the requester second.
+
+---
+
+## Development
+
+The application code lives in [`src/`](src/). Main runtime files:
+
+| File | Purpose |
+|---|---|
+| [`src/config.ru`](src/config.ru) | Rack/Sinatra entrypoint, environment config, routes, middlewares. |
+| [`src/service_runtime.rb`](src/service_runtime.rb) | Boot composition and role-specific listener startup. |
+| [`src/bridge_core.rb`](src/bridge_core.rb) | NATS request/response/session transport, dispatching, JetStream consumers. |
+| [`src/bridge_protocol.rb`](src/bridge_protocol.rb) | Bridge event protocol helpers. |
+| [`src/http_gateway.rb`](src/http_gateway.rb) | HTTP request conversion, upstream proxying, response rendering. |
+| [`src/tcp_tunnel_bridge.rb`](src/tcp_tunnel_bridge.rb) | `CONNECT` and SOCKS5 TCP tunnel bridge. |
+| [`src/socks5_server.rb`](src/socks5_server.rb) | SOCKS5 protocol handling. |
+| [`src/proxy_auth.rb`](src/proxy_auth.rb) | Proxy auth and safety lock. |
+| [`src/nats_async_runtime.rb`](src/nats_async_runtime.rb) | NATS client wrapper and backend resolution. |
+| [`src/observability_collector.rb`](src/observability_collector.rb) | In-memory flow, case, metric, and NATS state payloads. |
+
+Run tests from `src/`:
+
+```bash
+bundle exec rspec
+bundle exec rake spec:unit
+bundle exec rake spec:system
+bundle exec rake spec:contracts
+```
+
+Some tests start local NATS/system helpers and require the bundled test dependencies from `Gemfile`.
