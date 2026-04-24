@@ -1,6 +1,7 @@
 // @ts-check
 import { defineConfig } from 'astro/config';
 import starlight from '@astrojs/starlight';
+import mermaid from 'astro-mermaid';
 
 const repoUrl = 'https://github.com/artyomb/nats-proxy';
 
@@ -8,6 +9,7 @@ export default defineConfig({
 	site: 'https://artyomb.github.io',
 	base: '/nats-proxy',
 	integrations: [
+		mermaid(),
 		starlight({
 			title: 'NATS Proxy',
 			description: 'Documentation for the NATS Proxy Ruby gem.',
