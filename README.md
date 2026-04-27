@@ -207,56 +207,73 @@ The variables below are the minimum set needed to understand and start the servi
 
 ## Quick Start
 
-### Local Development
-
-Install Ruby dependencies from `src/`:
+Build the runtime image and run a local smoke-test topology in Docker: one NATS server, one receiver, and one requester.
 
 ```bash
-cd src
-bundle install
+REGISTRY_HOST=nats-proxy-local docker-compose -f docker/docker-compose.yml build nats_proxy
 ```
-
-Start NATS separately, then run one receiver and one requester. Example with core NATS:
 
 ```bash
-# terminal 1
-nats-server
-
-# terminal 2: receiver
-cd src
-SERVICE_ROLE=receiver \
-UPSTREAM_URL=http://127.0.0.1:8080 \
-NATS_URL=nats://127.0.0.1:4222 \
-NATS_MODE=core \
-PORT=7001 \
-bundle exec rackup -o 0.0.0.0 -p 7001 -s falcon
-
-# terminal 3: requester
-cd src
-SERVICE_ROLE=requester \
-NATS_URL=nats://127.0.0.1:4222 \
-NATS_MODE=core \
-PROXY_AUTH_ENABLED=false \
-PORT=7000 \
-bundle exec rackup -o 0.0.0.0 -p 7000 -s falcon
+docker network create nats-proxy
 ```
-
-Send traffic to the requester:
 
 ```bash
-curl -i http://127.0.0.1:7000/api/path
-curl -sS http://127.0.0.1:7000/observability/cases
+docker run -d \
+  --name nats-proxy-nats \
+  --network nats-proxy \
+  nats:2.11-alpine
 ```
-
-### Docker Image
-
-Build the image through the repository compose file:
 
 ```bash
-docker compose -f docker/docker-compose.yml build nats_proxy
+docker run -d \
+  --name nats-proxy-receiver \
+  --network nats-proxy \
+  -p 7001:7000 \
+  -e SERVICE_ROLE=receiver \
+  -e SERVICE_ID=receiver-local \
+  -e UPSTREAM_URL=http://example.com \
+  -e NATS_URL=nats://nats-proxy-nats:4222 \
+  -e NATS_MODE=core \
+  -e NATS_RESPONSE_SUBJECT_ROOT=proxy \
+  -e PROXY_AUTH_ENABLED=false \
+  -e PORT=7000 \
+  nats-proxy-local/nats-proxy
 ```
 
-For a two-node embedded NATS deployment, start the receiver first and the requester second.
+```bash
+docker run -d \
+  --name nats-proxy-requester \
+  --network nats-proxy \
+  -p 7000:7000 \
+  -e SERVICE_ROLE=requester \
+  -e SERVICE_ID=requester-local \
+  -e NATS_URL=nats://nats-proxy-nats:4222 \
+  -e NATS_MODE=core \
+  -e NATS_RESPONSE_SUBJECT_ROOT=proxy \
+  -e PROXY_AUTH_ENABLED=false \
+  -e PORT=7000 \
+  nats-proxy-local/nats-proxy
+```
+
+Verify the requester, receiver, and bridged request:
+
+```bash
+curl -fsS http://127.0.0.1:7000/healthcheck
+curl -fsS http://127.0.0.1:7001/healthcheck
+curl -sS http://127.0.0.1:7000/observability/nats
+curl -i http://127.0.0.1:7000/
+```
+
+The final request reaches the requester on host port `7000`, crosses NATS, and returns the upstream HTTP response through the receiver.
+
+Clean up the quick-start containers:
+
+```bash
+docker rm -f nats-proxy-requester nats-proxy-receiver nats-proxy-nats
+docker network rm nats-proxy
+```
+
+Both service containers disable proxy auth in this smoke test. Production proxy ingress should configure `PROXY_AUTH_USERS_JSON` instead of using `PROXY_AUTH_ENABLED=false`.
 
 ---
 

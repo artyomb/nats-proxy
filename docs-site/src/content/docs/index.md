@@ -69,33 +69,56 @@ For detailed placement options, see [Topology](concepts/topology/). For supporte
 
 ## Quick Start
 
-The shortest local path is one NATS server, one receiver, and one requester:
+The shortest runnable path is a Docker smoke test with one NATS server, one receiver, and one requester:
 
 ```bash
-# receiver
-cd src
-SERVICE_ROLE=receiver \
-UPSTREAM_URL=http://127.0.0.1:8080 \
-NATS_URL=nats://127.0.0.1:4222 \
-NATS_MODE=core \
-PORT=7001 \
-bundle exec rackup -o 0.0.0.0 -p 7001 -s falcon
+REGISTRY_HOST=nats-proxy-local docker-compose -f docker/docker-compose.yml build nats_proxy
 ```
 
 ```bash
-# requester
-cd src
-SERVICE_ROLE=requester \
-NATS_URL=nats://127.0.0.1:4222 \
-NATS_MODE=core \
-PROXY_AUTH_ENABLED=false \
-PORT=7000 \
-bundle exec rackup -o 0.0.0.0 -p 7000 -s falcon
+docker network create nats-proxy
+```
+
+```bash
+docker run -d --name nats-proxy-nats --network nats-proxy nats:2.11-alpine
+```
+
+```bash
+docker run -d \
+  --name nats-proxy-receiver \
+  --network nats-proxy \
+  -p 7001:7000 \
+  -e SERVICE_ROLE=receiver \
+  -e SERVICE_ID=receiver-local \
+  -e UPSTREAM_URL=http://example.com \
+  -e NATS_URL=nats://nats-proxy-nats:4222 \
+  -e NATS_MODE=core \
+  -e NATS_RESPONSE_SUBJECT_ROOT=proxy \
+  -e PROXY_AUTH_ENABLED=false \
+  -e PORT=7000 \
+  nats-proxy-local/nats-proxy
+```
+
+```bash
+docker run -d \
+  --name nats-proxy-requester \
+  --network nats-proxy \
+  -p 7000:7000 \
+  -e SERVICE_ROLE=requester \
+  -e SERVICE_ID=requester-local \
+  -e NATS_URL=nats://nats-proxy-nats:4222 \
+  -e NATS_MODE=core \
+  -e NATS_RESPONSE_SUBJECT_ROOT=proxy \
+  -e PROXY_AUTH_ENABLED=false \
+  -e PORT=7000 \
+  nats-proxy-local/nats-proxy
 ```
 
 ```bash
 curl -fsS http://127.0.0.1:7000/healthcheck
+curl -fsS http://127.0.0.1:7001/healthcheck
+curl -sS http://127.0.0.1:7000/observability/nats
 curl -i http://127.0.0.1:7000/
 ```
 
-See [Getting Started](getting-started/) for Docker, Compose, embedded NATS, and verification details.
+The proxied request to `:7000` should return the upstream HTTP response through NATS. See [Getting Started](getting-started/) for Compose, `docker run`, embedded NATS, cleanup, and verification details.
