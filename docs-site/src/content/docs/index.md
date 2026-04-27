@@ -58,67 +58,17 @@ For detailed placement options, see [Topology](concepts/topology/). For supporte
 
 | Need | Page |
 |---|---|
-| Run it locally or in Docker | [Getting Started](getting-started/) |
+| Start the service quickly with Docker | [Getting Started](getting-started/) |
 | Understand roles and placement | [Roles](concepts/roles/) and [Topology](concepts/topology/) |
 | Choose an ingress pattern | [Traffic Patterns](concepts/traffic-patterns/) |
 | Configure the service | [Environment](configuration/environment/), [Proxy Auth](configuration/proxy-auth/), [SOCKS5](configuration/socks5/) |
 | Understand internals | [Architecture Overview](architecture/overview/), [Bridge Protocol](architecture/bridge-protocol/), [NATS Transport](architecture/nats-transport/), [TCP Sessions](architecture/tcp-sessions/) |
-| Deploy with NATS | [External NATS](deployment/external-nats/), [Embedded NATS](deployment/embedded-nats/), [Self-NATS Leafnodes](deployment/self-nats-leafnodes/) |
+| Configure a deployment topology | [External NATS](deployment/external-nats/), [Embedded NATS](deployment/embedded-nats/), [Self-NATS Leafnodes](deployment/self-nats-leafnodes/) |
 | Operate and debug | [Observability](operations/observability/), [Healthcheck](operations/healthcheck/), [Troubleshooting](operations/troubleshooting/) |
 | Work on the codebase | [Local Dev](development/local-dev/), [Testing](development/testing/), [Code Map](development/code-map/) |
 
 ## Quick Start
 
-The shortest runnable path is a Docker smoke test with one NATS server, one receiver, and one requester:
+Use [Getting Started](getting-started/) to build the Docker image, start a local NATS-backed requester/receiver pair, and verify an HTTP request through the bridge.
 
-```bash
-REGISTRY_HOST=nats-proxy-local docker-compose -f docker/docker-compose.yml build nats_proxy
-```
-
-```bash
-docker network create nats-proxy
-```
-
-```bash
-docker run -d --name nats-proxy-nats --network nats-proxy nats:2.11-alpine
-```
-
-```bash
-docker run -d \
-  --name nats-proxy-receiver \
-  --network nats-proxy \
-  -p 7001:7000 \
-  -e SERVICE_ROLE=receiver \
-  -e SERVICE_ID=receiver-local \
-  -e UPSTREAM_URL=http://example.com \
-  -e NATS_URL=nats://nats-proxy-nats:4222 \
-  -e NATS_MODE=core \
-  -e NATS_RESPONSE_SUBJECT_ROOT=proxy \
-  -e PROXY_AUTH_ENABLED=false \
-  -e PORT=7000 \
-  nats-proxy-local/nats-proxy
-```
-
-```bash
-docker run -d \
-  --name nats-proxy-requester \
-  --network nats-proxy \
-  -p 7000:7000 \
-  -e SERVICE_ROLE=requester \
-  -e SERVICE_ID=requester-local \
-  -e NATS_URL=nats://nats-proxy-nats:4222 \
-  -e NATS_MODE=core \
-  -e NATS_RESPONSE_SUBJECT_ROOT=proxy \
-  -e PROXY_AUTH_ENABLED=false \
-  -e PORT=7000 \
-  nats-proxy-local/nats-proxy
-```
-
-```bash
-curl -fsS http://127.0.0.1:7000/healthcheck
-curl -fsS http://127.0.0.1:7001/healthcheck
-curl -sS http://127.0.0.1:7000/observability/nats
-curl -i http://127.0.0.1:7000/
-```
-
-The proxied request to `:7000` should return the upstream HTTP response through NATS. See [Getting Started](getting-started/) for Compose, `docker run`, embedded NATS, cleanup, and verification details.
+For complete deployment scenarios, see [External NATS](deployment/external-nats/), [Embedded NATS](deployment/embedded-nats/), and [Self-NATS Leafnodes](deployment/self-nats-leafnodes/). For source-based development, see [Local Dev](development/local-dev/).

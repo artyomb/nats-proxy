@@ -13,7 +13,7 @@ Receiver owns the upstream side and exposes the leaf listener:
 
 ```bash
 docker run -d \
-  --name proxy-gateway-receiver \
+  --name nats-proxy-receiver \
   --restart unless-stopped \
   -p 7000:7000 \
   -p 7422:7422 \
@@ -49,7 +49,7 @@ Requester connects its local embedded NATS leafnode to the receiver leaf listene
 
 ```bash
 docker run -d \
-  --name proxy-gateway-requester \
+  --name nats-proxy-requester \
   --restart unless-stopped \
   -p 17000:7000 \
   -p 37138:1080 \

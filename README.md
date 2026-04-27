@@ -207,7 +207,7 @@ The variables below are the minimum set needed to understand and start the servi
 
 ## Quick Start
 
-Build the runtime image and run a local smoke-test topology in Docker: one NATS server, one receiver, and one requester.
+Build the runtime image and run a local working topology in Docker: one NATS server, one receiver, and one requester.
 
 ```bash
 REGISTRY_HOST=nats-proxy-local docker-compose -f docker/docker-compose.yml build nats_proxy
@@ -270,10 +270,13 @@ Clean up the quick-start containers:
 
 ```bash
 docker rm -f nats-proxy-requester nats-proxy-receiver nats-proxy-nats
+```
+
+```bash
 docker network rm nats-proxy
 ```
 
-Both service containers disable proxy auth in this smoke test. Production proxy ingress should configure `PROXY_AUTH_USERS_JSON` instead of using `PROXY_AUTH_ENABLED=false`.
+Both service containers disable proxy auth for this quick local run. Production proxy ingress should configure `PROXY_AUTH_USERS_JSON` instead of using `PROXY_AUTH_ENABLED=false`.
 
 ---
 
