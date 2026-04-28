@@ -3,10 +3,18 @@ title: Docker
 description: Runtime image details and compose build entry point.
 ---
 
+This page is about the runtime image itself: how the image is named, what it contains, and which ports or entrypoint behavior matter after it is built. Placement and multi-node examples are covered by the other deployment pages.
+
 The deploy image is built from `docker/ruby/Dockerfile` with build context `src` and additional Docker context `docker`.
+
+`docker/docker-compose.yml` names the image as `${REGISTRY_HOST}/nats-proxy`. The repository includes `docker/.env` with a local default, or you can override `REGISTRY_HOST` when building.
 
 ```bash
 docker compose -f docker/docker-compose.yml build nats_proxy
+```
+
+```bash
+REGISTRY_HOST=nats-proxy-local docker compose -f docker/docker-compose.yml build nats_proxy
 ```
 
 The image includes:
@@ -19,4 +27,3 @@ The image includes:
 - healthcheck `curl --fail http://127.0.0.1:$PORT/healthcheck`.
 
 Default exposed behavior is controlled by `PORT=7000`. NATS ports are not exposed by the Dockerfile; publish `4222` or `7422` only when your deployment needs host access to embedded NATS client or leafnode ports.
-

@@ -40,7 +40,6 @@ export default defineConfig({
 						{ label: 'Bridge Protocol', slug: 'architecture/bridge-protocol' },
 						{ label: 'NATS Transport', slug: 'architecture/nats-transport' },
 						{ label: 'TCP Sessions', slug: 'architecture/tcp-sessions' },
-						{ label: 'Cancellation', slug: 'architecture/cancellation' },
 					],
 				},
 				{

@@ -31,6 +31,8 @@ Start NATS:
 docker run -d --name nats-proxy-nats --network nats-proxy nats:2.11-alpine
 ```
 
+The receiver uses `UPSTREAM_URL=http://example.com` only as a quick-start target. Replace it with the HTTP service you want the receiver side to call.
+
 Start the receiver:
 
 ```bash

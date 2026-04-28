@@ -1,58 +1,99 @@
 ---
 title: NATS Proxy
-description: Overview of nats-proxy roles, topology, and documentation entry points.
+description: User-facing overview of nats-proxy scenarios, roles, and documentation entry points.
 ---
 
-`nats-proxy` is a Ruby proxy gateway that moves HTTP and TCP proxy traffic through NATS.
+`nats-proxy` accepts regular HTTP/proxy requests from a client and carries them through NATS to another replica that performs the real outbound request.
 
-It is built for split-network deployments: the caller can reach a local proxy, the target service is reachable only from another node, and the two sides can communicate through NATS.
+It is useful when an application, SDK, browser, UI, or system proxy setting already knows how to talk HTTP, but you want NATS to be the transport between the client side and the required upstream. Instead of changing the client, you point it at a `nats-proxy` endpoint. The service accepts the request in its usual HTTP form, sends it through NATS to the upstream-facing side, that side performs an outbound HTTP request or opens a TCP connection, and the response returns through the same path.
 
-## Concept
+The practical result is a bridge for software that does not natively speak NATS:
 
-The service is a role-based proxy bridge. The requester is placed close to clients or local services. The receiver is placed close to the upstream system. The only required transport path between them is NATS.
+- Keep the same HTTP endpoint contract for the client.
+- Move the actual request/response path through a NATS bus.
+- Perform outbound requests from the upstream-facing side, where the required upstream or TCP target is reachable.
+- Inspect recent requests, responses, stream events, tunnel sessions, and NATS runtime state from local observability endpoints.
 
-One container image runs in one of two roles:
+## Main Scenarios
 
-| Role | What it does |
-|---|---|
-| `requester` | Accepts local HTTP, HTTP proxy absolute-form requests, `CONNECT`, and optional SOCKS5 traffic. It publishes bridge requests to NATS and reconstructs responses for the client. |
-| `receiver` | Consumes bridge requests from NATS, connects to `UPSTREAM_URL` or a requested TCP target, and publishes response or session events back to the requester. |
+### Remote HTTP Endpoint
+
+In this scenario, `nats-proxy` stands in front of a concrete HTTP upstream.
+
+A client calls the client-facing endpoint as if it was calling the upstream service. That endpoint sends the HTTP method, path, headers, and body through NATS. The upstream-facing side makes the real HTTP request to `UPSTREAM_URL` and sends the response back. For the client, the endpoint still behaves like a regular HTTP API.
 
 ```mermaid
-flowchart TB
-  subgraph caller_side["Caller side"]
-    direction TB
-    caller["Client / local service"]
-    requester["requester"]
-    caller -->|"HTTP / proxy / CONNECT / SOCKS5"| requester
+flowchart LR
+  client["Client / UI / SDK"]
+  upstream["UPSTREAM_URL<br/>HTTP service"]
+
+  subgraph transport["NATS transport"]
+    entry["nats-proxy endpoint<br/>same HTTP API"]
+    outbound["nats-proxy outbound side"]
+    entry <-->|request / response over NATS| outbound
   end
 
-  subgraph nats_side["NATS transport"]
-    nats[("NATS")]
-  end
-
-  subgraph upstream_side["Upstream side"]
-    direction TB
-    receiver["receiver"]
-    upstream["HTTP upstream / TCP target"]
-    receiver -->|"HTTP request / TCP connection"| upstream
-  end
-
-  requester -->|"request down / response up"| nats
-  nats -->|"bridge traffic both ways"| receiver
+  client <-->|HTTP request / response| entry
+  outbound <-->|HTTP request / response| upstream
 ```
 
-For detailed placement options, see [Topology](concepts/topology/). For supported caller traffic, see [Traffic Patterns](concepts/traffic-patterns/).
+Use this when the client should keep the same HTTP API contract, while the actual upstream request must be made from the other side of NATS.
+
+### Network Proxy
+
+In this scenario, `nats-proxy` is configured as a normal HTTP proxy or SOCKS5 proxy, but the proxy traffic itself still goes through the NATS bus.
+
+The client uses standard proxy support: an HTTP proxy URL, an HTTP `CONNECT` tunnel, system proxy settings, or the optional SOCKS5 listener. The client-facing endpoint accepts that proxy traffic and forwards it through NATS to the upstream-facing side. That side then opens the requested HTTP or TCP connection.
+
+```mermaid
+flowchart LR
+  client["Client<br/>proxy settings"]
+  target["Requested target<br/>HTTP or TCP"]
+
+  subgraph transport["NATS transport"]
+    entry["nats-proxy endpoint<br/>HTTP proxy / SOCKS5"]
+    outbound["nats-proxy outbound side"]
+    entry <-->|proxy traffic over NATS| outbound
+  end
+
+  client <-->|HTTP proxy<br/>CONNECT<br/>SOCKS5| entry
+  outbound <-->|HTTP request<br/>or TCP connection| target
+```
+
+Use this when the client already supports HTTP proxy or SOCKS5 settings, and you need HTTP requests or TCP tunnels to cross the NATS bus.
+
+## Roles
+
+The same container image runs on both sides. The role only decides which side of the flow the container serves:
+
+| Role | Responsibility |
+|---|---|
+| `requester` | Entry point for clients. Put this where applications, browsers, tools, or proxy settings can reach it. It accepts the client request and returns the final response. |
+| `receiver` | Outbound side. Put this where the required `UPSTREAM_URL` or requested TCP target is reachable. It performs the real outbound request or connection. |
+
+The client does not need to know about NATS. Between `requester` and `receiver`, the only required path is NATS.
+
+For role-specific behavior, see [Roles](concepts/roles/). For placement variants and topology details, see [Topology](concepts/topology/).
+
+## What Clients Can Send
+
+Clients can use the `nats-proxy` endpoint in these ways:
+
+- Direct HTTP: the client calls `nats-proxy` like the upstream API; the outbound side forwards to `UPSTREAM_URL`.
+- HTTP proxy: the client configures `nats-proxy` as an HTTP proxy; proxy traffic crosses NATS before the outbound request is made.
+- HTTP `CONNECT`: the client opens a TCP tunnel through `nats-proxy`; the outbound side connects to the requested host and port.
+- SOCKS5: optional proxy listener with the same NATS-backed TCP tunnel behavior.
+- Streaming HTTP responses: SSE and NDJSON responses are returned as streams.
+
+For technical details and examples for each pattern, see [Traffic Patterns](concepts/traffic-patterns/).
 
 ## Capabilities
 
-- Plain HTTP forwarding through NATS.
-- HTTP proxy absolute-form forwarding.
-- HTTP `CONNECT` and optional SOCKS5 tunnels.
-- Streaming HTTP responses for SSE and NDJSON.
 - Core NATS and JetStream backends.
-- Optional proxy authentication for proxy-specific ingress.
-- Local observability UI and JSON APIs.
+- Binary-safe chunk transport using base64 when a response chunk is not valid UTF-8.
+- Best-effort stream cancellation when the downstream client disconnects.
+- Local observability UI and JSON APIs for flows, cases, metrics, and NATS runtime state.
+- Optional proxy authentication with bcrypt-hashed users for HTTP proxy, `CONNECT`, and SOCKS5 traffic.
 
 ## Documentation Map
 
@@ -60,15 +101,13 @@ For detailed placement options, see [Topology](concepts/topology/). For supporte
 |---|---|
 | Start the service quickly with Docker | [Getting Started](getting-started/) |
 | Understand roles and placement | [Roles](concepts/roles/) and [Topology](concepts/topology/) |
-| Choose an ingress pattern | [Traffic Patterns](concepts/traffic-patterns/) |
+| Choose a client traffic pattern | [Traffic Patterns](concepts/traffic-patterns/) |
 | Configure the service | [Environment](configuration/environment/), [Proxy Auth](configuration/proxy-auth/), [SOCKS5](configuration/socks5/) |
 | Understand internals | [Architecture Overview](architecture/overview/), [Bridge Protocol](architecture/bridge-protocol/), [NATS Transport](architecture/nats-transport/), [TCP Sessions](architecture/tcp-sessions/) |
 | Configure a deployment topology | [External NATS](deployment/external-nats/), [Embedded NATS](deployment/embedded-nats/), [Self-NATS Leafnodes](deployment/self-nats-leafnodes/) |
 | Operate and debug | [Observability](operations/observability/), [Healthcheck](operations/healthcheck/), [Troubleshooting](operations/troubleshooting/) |
 | Work on the codebase | [Local Dev](development/local-dev/), [Testing](development/testing/), [Code Map](development/code-map/) |
 
-## Quick Start
+## Next Step
 
 Use [Getting Started](getting-started/) to build the Docker image, start a local NATS-backed requester/receiver pair, and verify an HTTP request through the bridge.
-
-For complete deployment scenarios, see [External NATS](deployment/external-nats/), [Embedded NATS](deployment/embedded-nats/), and [Self-NATS Leafnodes](deployment/self-nats-leafnodes/). For source-based development, see [Local Dev](development/local-dev/).

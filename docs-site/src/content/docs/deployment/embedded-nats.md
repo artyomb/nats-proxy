@@ -12,6 +12,8 @@ Embedded startup requires one of:
 - `EMBEDDED_NATS_CONFIG=/path/to/nats.conf`
 - `EMBEDDED_NATS_GENERATE_CONFIG=true`
 
+Generated config requires an explicit `SERVICE_ROLE`. In requester role it also requires `LEAF_REMOTE_HOST` and either `LEAF_REMOTE_USER` plus `LEAF_REMOTE_PASSWORD`, or `LEAF_REMOTE_NKEY`.
+
 Generated config includes:
 
 - optional JetStream store configuration;

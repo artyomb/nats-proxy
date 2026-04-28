@@ -16,6 +16,8 @@ Run a local NATS server:
 nats-server
 ```
 
+The receiver command below uses `UPSTREAM_URL=http://example.com` only as a local smoke-test target. Replace it with the HTTP service you want the receiver side to call.
+
 Start the receiver from another terminal:
 
 ```bash

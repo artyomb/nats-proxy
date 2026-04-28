@@ -3,6 +3,8 @@ title: Troubleshooting
 description: Symptom-driven checks for common runtime failures.
 ---
 
+Start with the symptom seen by the caller, then check the requester and receiver observability endpoints. Most failures are either a role/config mismatch, a NATS path issue, or the receiver being unable to reach the final upstream or TCP target.
+
 | Symptom | Probable cause | Check | Fix |
 |---|---|---|---|
 | Requester returns `503 Service Unavailable` | Runtime boot not ready or no outbound bridge and no direct upstream fallback | `curl -sS http://requester:7000/observability/nats` | Check NATS connectivity, `NATS_URL`, `NATS_MODE`, and requester boot logs. |
@@ -15,4 +17,3 @@ description: Symptom-driven checks for common runtime failures.
 | Upstream unavailable | `UPSTREAM_URL` missing or target refuses/times out | Receiver logs; HTTP response body includes `Upstream unavailable` or missing upstream message | Set `UPSTREAM_URL` on receiver and verify receiver-to-upstream network path. |
 | Embedded requester exits on startup | Missing or conflicting leaf remote config | Container logs from entrypoint | Set `LEAF_REMOTE_HOST` plus either `LEAF_REMOTE_USER`/`LEAF_REMOTE_PASSWORD` or `LEAF_REMOTE_NKEY`, not both. |
 | Embedded leaf connection fails | Receiver leaf listener not reachable or credentials mismatch | `ss -ltnp` on receiver for `:7422`; requester logs | Start receiver first, expose `7422`, and use receiver leaf credentials on requester. |
-

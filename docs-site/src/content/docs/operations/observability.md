@@ -5,6 +5,8 @@ description: Runtime UI and JSON endpoints for flows, cases, metrics, and NATS s
 
 Observability is local to each process and backed by an in-memory recent event buffer. It is useful for diagnosis, not long-term storage.
 
+The collector keeps events for the most recent request ids only. A quiet process can report `feed_health.state=stale`; that means no recent events were recorded, not necessarily that the service is unhealthy.
+
 | Endpoint | Purpose |
 |---|---|
 | `GET /observability` | HTML UI. |
@@ -50,4 +52,3 @@ curl -sS http://127.0.0.1:7000/observability/nats
 ```
 
 The payload includes boot state, role, backend, bridge inbound/outbound readiness, NATS connection status, server info, ping counters, and JetStream stream/consumer details when the resolved backend is JetStream.
-
