@@ -471,6 +471,7 @@ module SystemHelpers
     queue_group: consumer_name,
     response_timeout: 2,
     stream_timeout: 2,
+    receiver_max_inflight: 20,
     socks5: false,
     socks5_port: nil,
     proxy_auth_users_json: nil,
@@ -498,7 +499,7 @@ module SystemHelpers
       "NATS_JS_API_PREFIX" => js_api_prefix,
       "NATS_RESPONSE_TIMEOUT" => response_timeout.to_s,
       "STREAM_RESPONSE_TIMEOUT" => stream_timeout.to_s,
-      "RECEIVER_MAX_INFLIGHT" => "20",
+      "RECEIVER_MAX_INFLIGHT" => receiver_max_inflight.to_s,
       "SOCKS5_ENABLED" => socks5 ? "true" : "false",
       "SOCKS5_LISTEN_HOST" => "127.0.0.1",
       "SOCKS5_LISTEN_PORT" => socks5_port.to_s,
@@ -569,7 +570,7 @@ module SystemHelpers
     MSG
   end
 
-  def with_service_process(mode:, role:, nats_url:, upstream_url: nil, socks5: false, proxy_auth_users_json: nil, response_timeout: 2, stream_timeout: 2, js_api_prefix: nil, request_subject_root: "to.proxy", response_subject_root: "from.proxy", listen_subject: "#{request_subject_root}.requests.>")
+  def with_service_process(mode:, role:, nats_url:, upstream_url: nil, socks5: false, proxy_auth_users_json: nil, response_timeout: 2, stream_timeout: 2, receiver_max_inflight: 20, js_api_prefix: nil, request_subject_root: "to.proxy", response_subject_root: "from.proxy", listen_subject: "#{request_subject_root}.requests.>")
     service = ExternalServiceProcess.new(
       name: role,
       port: free_port,
@@ -584,6 +585,7 @@ module SystemHelpers
         listen_subject:,
         response_timeout:,
         stream_timeout:,
+        receiver_max_inflight:,
         socks5:,
         socks5_port: socks5 ? free_port : nil,
         proxy_auth_users_json:,
@@ -602,7 +604,7 @@ module SystemHelpers
     service&.stop
   end
 
-  def with_service_cluster(mode:, upstream_url:, socks5: false, proxy_auth_users_json: nil, response_timeout: 2, stream_timeout: 2)
+  def with_service_cluster(mode:, upstream_url:, socks5: false, proxy_auth_users_json: nil, response_timeout: 2, stream_timeout: 2, receiver_max_inflight: 20)
     with_leaf_topology_nats do |nats_context|
       stream_name = "system-#{mode}-#{SecureRandom.hex(3)}"
       if mode == :jetstream
@@ -636,6 +638,7 @@ module SystemHelpers
           queue_group: "spec-#{mode}-receiver-#{SecureRandom.hex(3)}",
           response_timeout:,
           stream_timeout:,
+          receiver_max_inflight:,
           proxy_auth_users_json:,
           js_api_prefix: mode == :jetstream ? "$JS.API" : nil
         ),
@@ -658,6 +661,7 @@ module SystemHelpers
           queue_group: "spec-#{mode}-requester-#{SecureRandom.hex(3)}",
           response_timeout:,
           stream_timeout:,
+          receiver_max_inflight:,
           socks5:,
           socks5_port: socks5 ? free_port : nil,
           proxy_auth_users_json:,

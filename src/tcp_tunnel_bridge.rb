@@ -87,10 +87,22 @@ class TcpTunnelBridge
     end
   end
 
-  def handle_stream_request(payload:, cancel_check:, emit_failure_response:, request_id:, upstream_queue:, &emit)
+  def handle_stream_request(
+    payload:,
+    cancel_check:,
+    emit_failure_response:,
+    request_id:,
+    upstream_queue:,
+    detached: false,
+    task_parent: nil,
+    on_complete: nil,
+    &emit
+  )
     host = payload['host'].to_s
     port = payload['port'].to_i
     requester_service_id = payload['requester_service_id'].to_s
+    socket_detached = false
+    task_parent ||= Async::Task.current? if detached
 
     if host.empty? || port <= 0
       raise BridgeProtocol::InvalidRequestError, 'Missing or invalid host/port for tcp_stream'
@@ -102,6 +114,10 @@ class TcpTunnelBridge
 
     unless upstream_queue
       raise BridgeProtocol::InvalidRequestError, 'Missing upstream_queue for tcp_stream session'
+    end
+
+    if detached && !task_parent
+      raise BridgeProtocol::UpstreamUnavailableError, 'Missing async task parent for tcp_stream session'
     end
 
     socket = connect_target(host, port)
@@ -134,11 +150,28 @@ class TcpTunnelBridge
     )
     LOGGER.info "Session established: session_id=#{request_id}, target=#{host}:#{port}, backend=#{@nats_backend}"
 
+    if detached
+      socket_detached = true
+      task_parent.async(annotation: "tcp-session-#{request_id}") do |session_task|
+        outcome = pump_receiver_tunnel(session_task, socket, upstream_queue, cancel_check, request_id, requester_service_id, &emit)
+        on_complete&.call(outcome)
+      rescue Async::Stop
+        raise
+      rescue => e
+        LOGGER.error "Detached session failed: session_id=#{request_id}, error=#{e.class} - #{e.message}"
+        emit.call(BridgeProtocol.error_event("Tunnel error: #{e.message}"))
+        on_complete&.call(BridgeProtocol::OUTCOME_UPSTREAM_ERROR)
+      ensure
+        socket&.close rescue nil
+      end
+      return BridgeProtocol::OUTCOME_DETACHED
+    end
+
     with_async_task do |task|
       pump_receiver_tunnel(task, socket, upstream_queue, cancel_check, request_id, requester_service_id, &emit)
     end
   ensure
-    socket&.close rescue nil
+    socket&.close unless socket_detached rescue nil
   end
 
   private
@@ -169,6 +202,7 @@ class TcpTunnelBridge
       LOGGER.info "Session target socket closed: session_id=#{session_id}, error=#{e.class}"
     ensure
       stop = true
+      socket.close rescue nil
     end
 
     writer = task.async do
@@ -185,6 +219,7 @@ class TcpTunnelBridge
       LOGGER.info "Session target write failed: session_id=#{session_id}, error=#{e.class}"
     ensure
       stop = true
+      socket.close rescue nil
     end
 
     reader.wait

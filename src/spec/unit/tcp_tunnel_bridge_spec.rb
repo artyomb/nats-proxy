@@ -1,4 +1,7 @@
 require_relative "../spec_helper"
+require_relative "../../bridge_core"
+require_relative "../../nats_async_runtime"
+require_relative "../../request_context"
 require_relative "../../tcp_tunnel_bridge"
 
 RSpec.describe TcpTunnelBridge do

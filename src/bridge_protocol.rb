@@ -14,6 +14,7 @@ module BridgeProtocol
   OUTCOME_UPSTREAM_ERROR = 'upstream_error'.freeze
   OUTCOME_PROTOCOL_ERROR = 'protocol_error'.freeze
   OUTCOME_SESSION_ERROR = 'session_error'.freeze
+  OUTCOME_DETACHED = 'detached'.freeze
 
   SESSION_ESTABLISHED = 'session_established'.freeze
   SESSION_CLOSE = 'session_close'.freeze

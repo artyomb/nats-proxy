@@ -62,6 +62,7 @@ class BridgeCore
     @dispatcher_task = nil
     @upstream_session_listener_task = nil
     @downstream_session_listener_task = nil
+    @session_barrier = Concurrent::AtomicReference.new(nil)
   end
 
   def bridge_outbound? = listener_alive?(@response_listener_task)
@@ -570,15 +571,45 @@ class BridgeCore
     context = RequestContext.new(request_id:, initial_state: 'active')
     @active_streams[request_id] = context
     context.upstream_queue = Async::Queue.new if operation == 'tcp_stream'
+    detached_lifecycle = false
+    session_close_emitted = false
 
-    proxy_outcome = handler.call(
+    complete_stream = lambda do |proxy_outcome|
+      if proxy_outcome == BridgeProtocol::OUTCOME_CANCELED
+        if operation == 'tcp_stream'
+          unless session_close_emitted
+            publish_event(reply_to, BridgeProtocol.session_close_event(reason: context.cancel_reason || 'cancel_requested'), raw: publish_raw?, headers: nats_headers)
+          end
+        else
+          cancel_reason = context.cancel_reason.to_s
+          cancel_reason = 'cancel_requested' if cancel_reason.empty?
+          publish_cancel_diagnostic(reply_to, reason: cancel_reason, headers: nats_headers)
+        end
+      end
+
+      final_outcome = context.finalize!(fallback_outcome: proxy_outcome || BridgeProtocol::OUTCOME_COMPLETED)
+      LOGGER.info "Receiver stream finished: request_id=#{request_id}, outcome=#{final_outcome}, cancel_reason=#{context.cancel_reason || '-'}, backend=#{@nats_backend}"
+    ensure
+      @active_streams.delete(request_id)
+    end
+
+    handler_kwargs = {
       payload:,
       cancel_check: -> { context.cancel_requested? },
       emit_failure_response: publish_raw?,
       request_id: request_id,
       upstream_queue: context.upstream_queue
-    ) do |event|
+    }
+
+    if operation == 'tcp_stream'
+      handler_kwargs[:detached] = true
+      handler_kwargs[:task_parent] = @session_barrier.get
+      handler_kwargs[:on_complete] = complete_stream
+    end
+
+    proxy_outcome = handler.call(**handler_kwargs) do |event|
       next unless context.allow_event_after_cancel?(event['type'], allow_end: true)
+      session_close_emitted = true if event['type'] == BridgeProtocol::SESSION_CLOSE
 
       enriched =
         if [BridgeProtocol::RESPONSE_START, BridgeProtocol::SESSION_ESTABLISHED].include?(event['type'])
@@ -590,18 +621,12 @@ class BridgeCore
       on_event&.call(enriched)
     end
 
-    if proxy_outcome == BridgeProtocol::OUTCOME_CANCELED
-      if operation == 'tcp_stream'
-        publish_event(reply_to, BridgeProtocol.session_close_event(reason: context.cancel_reason || 'cancel_requested'), raw: publish_raw?, headers: nats_headers)
-      else
-        cancel_reason = context.cancel_reason.to_s
-        cancel_reason = 'cancel_requested' if cancel_reason.empty?
-        publish_cancel_diagnostic(reply_to, reason: cancel_reason, headers: nats_headers)
-      end
+    if proxy_outcome == BridgeProtocol::OUTCOME_DETACHED
+      detached_lifecycle = true
+      return proxy_outcome
     end
 
-    final_outcome = context.finalize!(fallback_outcome: proxy_outcome || BridgeProtocol::OUTCOME_COMPLETED)
-    LOGGER.info "Receiver stream finished: request_id=#{request_id}, outcome=#{final_outcome}, cancel_reason=#{context.cancel_reason || '-'}, backend=#{@nats_backend}"
+    complete_stream.call(proxy_outcome)
   rescue BridgeProtocol::InvalidRequestError => e
     reply_to ||= normalize_reply_subject(reply_subject(msg))
     raise if reply_to.to_s.empty?
@@ -609,7 +634,7 @@ class BridgeCore
     LOGGER.warn "Rejected malformed bridge request: error=#{e.message}, backend=#{@nats_backend}"
     reject_invalid_request(reply_to, error: e.message, nats_headers: nats_headers || trace_headers(msg.header))
   ensure
-    @active_streams.delete(request_id) if defined?(request_id) && request_id
+    @active_streams.delete(request_id) if defined?(request_id) && request_id && !detached_lifecycle
   end
 
   def dispatch_bridge_message(msg, queue:, manual_ack:)
@@ -721,7 +746,9 @@ class BridgeCore
   def start_dispatcher(task, queue, in_progress_interval:)
     task.async(annotation: "bridge-dispatcher-#{@service_id}") do |dispatcher_task|
       barrier = Async::Barrier.new(parent: dispatcher_task)
+      session_barrier = Async::Barrier.new(parent: dispatcher_task)
       semaphore = Async::Semaphore.new(@max_inflight, parent: barrier)
+      @session_barrier.set(session_barrier)
 
       @dispatcher_alive.make_true
       loop do
@@ -741,8 +768,11 @@ class BridgeCore
         end
       end
     ensure
+      @session_barrier.set(nil)
       barrier&.cancel
       barrier&.wait
+      session_barrier&.cancel
+      session_barrier&.wait
       @dispatcher_alive.make_false
     end
   end
