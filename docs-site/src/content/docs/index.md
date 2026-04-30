@@ -73,6 +73,9 @@ The same container image runs on both sides. The role only decides which side of
 
 The client does not need to know about NATS. Between `requester` and `receiver`, the only required path is NATS.
 
+You can run more than one requester or receiver. Requesters are the entry points chosen by your clients or platform, while receivers can form a worker pool on the outbound side.
+NATS balances only the beginning of each request or tunnel session; after a receiver starts handling a flow, the rest of that flow is routed between the original requester and the selected receiver.
+
 For role-specific behavior, see [Roles](concepts/roles/). For placement variants and topology details, see [Topology](concepts/topology/).
 
 ## What Clients Can Send
@@ -90,6 +93,7 @@ For technical details and examples for each pattern, see [Traffic Patterns](conc
 ## Capabilities
 
 - Core NATS and JetStream backends.
+- Multi-instance requester/receiver topologies with receiver-balanced flow starts.
 - Binary-safe chunk transport using base64 when a response chunk is not valid UTF-8.
 - Best-effort stream cancellation when the downstream client disconnects.
 - Local observability UI and JSON APIs for flows, cases, metrics, and NATS runtime state.

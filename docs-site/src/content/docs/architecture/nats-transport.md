@@ -20,16 +20,17 @@ The service uses two configurable roots:
 - `NATS_REQUEST_SUBJECT_ROOT`, default `to.proxy`
 - `NATS_RESPONSE_SUBJECT_ROOT`, default `from.proxy`
 
-`SERVICE_ID` is embedded in request, response, and session subjects so each requester can listen only to its own response scope.
+`SERVICE_ID` is embedded in request, response, session, and cancel subjects. NATS balances only the initial request or session-open message. After a receiver becomes the flow owner, the rest of that flow is addressed to the original requester and the selected receiver.
 
 | Purpose | Pattern | Publisher | Consumer |
 |---|---|---|---|
 | Request envelope | `<request_root>.requests.<requester_service_id>.<request_id>` | requester | receiver request listener |
 | Response event | `<response_root>.responses.<requester_service_id>.<request_id>` | receiver | requester response listener |
-| Upstream TCP frame | `<request_root>.sessions.upstream.<requester_service_id>.<session_id>` | requester | receiver upstream session listener |
+| Upstream TCP frame | `<request_root>.sessions.upstream.<receiver_service_id>.<session_id>` | requester | owner receiver upstream session listener |
 | Downstream TCP frame | `<response_root>.sessions.downstream.<requester_service_id>.<session_id>` | receiver | requester downstream session listener |
+| Owner cancel | `<request_root>.cancel.<receiver_service_id>.<request_id_or_session_id>` | requester | owner receiver cancel listener |
 
-The default receiver listen subject is `to.proxy.requests.>`. Response listeners and session listeners subscribe to service-specific wildcard scopes derived from their role and `SERVICE_ID`.
+The default receiver listen subject is `to.proxy.requests.>`. Response, session, and cancel listeners subscribe to service-specific wildcard scopes derived from their role and `SERVICE_ID`.
 
 ```mermaid
 flowchart LR
@@ -54,7 +55,7 @@ flowchart LR
 
     subgraph tcp_upstream["TCP upstream frames"]
       direction LR
-      requester_tcp_up["requester"] -->|client bytes| up_subject["to.proxy.sessions.upstream.req-1.*"]
+      requester_tcp_up["requester"] -->|client bytes| up_subject["to.proxy.sessions.upstream.rec-1.*"]
       up_subject --> receiver_tcp_up["receiver"]
     end
 
@@ -71,7 +72,7 @@ flowchart LR
 In Core NATS mode:
 
 - request listener uses `subscribe(LISTEN_SUBJECT, queue: NATS_QUEUE_GROUP)`;
-- response and session listeners use plain wildcard subscriptions;
+- response, session, and cancel listeners use plain wildcard subscriptions;
 - messages are published as raw Core NATS payloads;
 - invalid request envelopes can be answered directly with controlled response events.
 
@@ -81,7 +82,7 @@ Core NATS does not persist bridge messages. If no receiver is subscribed, the re
 
 In JetStream mode:
 
-- request, response, and session listeners are pull consumers on `NATS_STREAM`;
+- request, response, session, and cancel listeners are pull consumers on `NATS_STREAM`;
 - request processing uses durable consumer `NATS_CONSUMER_NAME` with explicit acknowledgements;
 - the receiver dispatch queue is bounded by `RECEIVER_MAX_INFLIGHT` and internal `QUEUE_SIZE`;
 - long-running receiver work sends `in_progress` heartbeats while the message is being handled.
@@ -102,8 +103,11 @@ Requester response and session consumers are service-specific:
 | Response events | `<NATS_CONSUMER_NAME>-responses-<SERVICE_ID>` |
 | Receiver upstream session frames | `<NATS_CONSUMER_NAME>-sessions-upstream-<SERVICE_ID>` |
 | Requester downstream session frames | `<NATS_CONSUMER_NAME>-sessions-downstream-<SERVICE_ID>` |
+| Receiver cancel envelopes | `<NATS_CONSUMER_NAME>-cancel-<SERVICE_ID>` |
 
 Session-open messages for `tcp_stream` are acknowledged after `session_established` is emitted when possible. This prevents a long-lived tunnel from blocking the request consumer for the full tunnel lifetime.
+
+For a multi-instance receiver pool, every live instance must have a unique `SERVICE_ID`. Core NATS receiver replicas that share work should use the same `LISTEN_SUBJECT` and `NATS_QUEUE_GROUP`; JetStream receiver replicas should share the same base `NATS_CONSUMER_NAME` for request work. Do not split Core and JetStream by message plane: `NATS_MODE` applies to request, response, session, and cancel traffic together.
 
 ## Embedded Stream Bootstrap
 

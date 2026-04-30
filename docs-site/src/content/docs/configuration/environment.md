@@ -10,7 +10,7 @@ This page lists environment variables read by the Ruby app, Docker runtime image
 | Variable | Default | Applies to | Required when | Description | Example |
 |---|---|---|---|---|---|
 | `SERVICE_ROLE` | `receiver` if `UPSTREAM_URL` is set, else `requester` | both | No | Runtime role. Must be `requester` or `receiver` when set. | `requester` |
-| `SERVICE_ID` | `srv-<random>` | both | No | Instance identifier used in NATS subjects and observability output. Set a stable value when you need predictable subject scopes. | `requester-a` |
+| `SERVICE_ID` | `srv-<random>` | both | No | Instance identifier used in NATS subjects and observability output. Set a stable, unique value for every live requester and receiver instance. | `requester-a` |
 | `UPSTREAM_URL` | unset | receiver | Receiver-side HTTP forwarding | Base URL used by `http_request` handling when the requester sends origin-form paths. TCP tunnels do not require it. | `http://app:8080` |
 | `PORT` | `7000` in Docker image | both | No | Rack/Falcon bind port used by the runtime image `CMD`. | `7000` |
 | `APP_ENV` | unset | both | No | When set to `test`, disables the async warmup hook in `config.ru`. | `test` |
@@ -25,12 +25,18 @@ This page lists environment variables read by the Ruby app, Docker runtime image
 | `NATS_URL` | `nats://localhost:4222` | both | No | NATS server URL used by the Ruby app process. | `nats://127.0.0.1:4222` |
 | `NATS_MODE` | `auto` | both | No | Backend mode: `core`, `jetstream`, or `auto`. | `jetstream` |
 | `NATS_STREAM` | `proxy` | both | JetStream mode | JetStream stream used by pull consumers and JetStream publishes. | `proxy` |
-| `NATS_CONSUMER_NAME` | `nats-proxy` | both | No | Base durable consumer name. Requester response/session consumers add service-specific suffixes. | `nats-proxy` |
-| `NATS_QUEUE_GROUP` | value of `NATS_CONSUMER_NAME` | receiver | Core NATS mode | Queue group for the receiver request subscription. | `receivers` |
-| `NATS_REQUEST_SUBJECT_ROOT` | `to.proxy` | both | No | Root for request and upstream session subjects. | `to.proxy` |
+| `NATS_CONSUMER_NAME` | `nats-proxy` | both | No | Base durable consumer name. JetStream receiver replicas that share work use the same base request consumer; requester response/session consumers add service-specific suffixes. | `nats-proxy` |
+| `NATS_QUEUE_GROUP` | value of `NATS_CONSUMER_NAME` | receiver | Core NATS mode | Queue group for the receiver request subscription. Core receiver replicas that share work use the same value. | `receivers` |
+| `NATS_REQUEST_SUBJECT_ROOT` | `to.proxy` | both | No | Root for request, upstream session, and cancel subjects. | `to.proxy` |
 | `NATS_RESPONSE_SUBJECT_ROOT` | `from.proxy` | both | No | Root for response and downstream session subjects. | `from.proxy` |
-| `LISTEN_SUBJECT` | `<request_root>.requests.>` | receiver | No | Receiver subscription filter for bridge request envelopes. | `to.proxy.requests.>` |
+| `LISTEN_SUBJECT` | `<request_root>.requests.>` | receiver | No | Receiver subscription filter for bridge request envelopes. Receiver replicas in the same pool use the same value. | `to.proxy.requests.>` |
 | `NATS_JS_API_PREFIX` | `$JS.API`, or resolved from embedded NATS domain | both | No | JetStream API prefix. Embedded mode exports the resolved value after starting `nats-server`. | `$JS.DOMAIN.API` |
+
+## Multi-Instance Notes
+
+- NATS balances only initial request envelopes and session-open envelopes.
+- After the receiver owner is selected, response events, tunnel bytes, and cancellation are routed by `SERVICE_ID`.
+- Keep each live `SERVICE_ID` unique. Share `NATS_QUEUE_GROUP` in Core NATS or the base `NATS_CONSUMER_NAME` in JetStream only for receiver replicas that should divide new work.
 
 ## Timeouts And Receiver Load
 

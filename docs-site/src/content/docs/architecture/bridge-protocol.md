@@ -55,12 +55,21 @@ HTTP responses are returned as ordered JSON events on `reply_to`.
 
 | Event | Payload |
 |---|---|
-| `response_start` | HTTP `status`, normalized response `headers`, `content_type`, `streaming`, and receiver metadata. |
+| `response_start` | HTTP `status`, normalized response `headers`, `content_type`, `streaming`, and owner metadata such as `receiver_service_id`, `request_id`, and `flow_kind`. |
 | `response_chunk` | `body` for valid UTF-8 chunks, or `body_encoding=base64` and `body_base64` for binary chunks. |
 | `response_error` | `error` string for stream failures or cancellation diagnostics. |
 | `response_end` | Terminal marker for the HTTP response. |
 
 `text/event-stream` and `application/x-ndjson` responses are treated as streaming. Other responses are buffered until `response_end`, then returned as a normal Rack response body.
+
+## Owner Metadata
+
+The first successful event of a flow selects the receiver that owns the rest of that flow.
+
+- `response_start` carries `receiver_service_id`, `request_id`, and `flow_kind` for HTTP flows.
+- `session_established` carries `receiver_service_id`, `session_id`, and `flow_kind` for TCP tunnel flows.
+
+The requester stores this metadata in its request context. It is then used for owner-addressed cancellation and, for established TCP sessions, for upstream session bytes sent back to the receiver that opened the target connection.
 
 ## Non-Streaming Request
 
@@ -121,7 +130,7 @@ If the upstream fails after a stream has started, the receiver emits `response_e
 
 ## Cancellation
 
-Cancellation is best effort. It is used when a downstream streaming client disconnects, a stream times out, or a tunnel writer fails. The requester publishes a cancel envelope to the original request subject:
+Cancellation is best effort. It is used when a downstream streaming client disconnects, a stream times out, or a tunnel writer fails. After owner selection, the requester publishes a cancel envelope to the owner-scoped subject `<request_root>.cancel.<receiver_service_id>.<request_id_or_session_id>`. Before the requester knows `receiver_service_id`, cancellation falls back to the original request subject as a best-effort early cancel.
 
 ```json
 {
@@ -136,7 +145,7 @@ Cancellation is best effort. It is used when a downstream streaming client disco
 }
 ```
 
-Receiver-side active streams observe this envelope through `BridgeCore#process_cancel_message`. Duplicate or late cancels are ignored.
+Receiver-side active streams observe this envelope through the owner-scoped cancel listener or through the early fallback path in the request listener. Duplicate or late cancels are ignored.
 
 `RequestContext` allows a bounded trailing event after cancel. In the current code this is one `response_chunk`, plus a terminal `response_end` or `session_close` when present. This keeps cancellation from corrupting an already in-flight terminal event while still stopping further work as soon as the receiver sees the cancel.
 

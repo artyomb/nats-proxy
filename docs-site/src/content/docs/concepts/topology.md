@@ -40,6 +40,55 @@ flowchart LR
 
 The caller and target stay outside the NATS transport. Only requester and receiver have to share the NATS path.
 
+## Multi-Instance Shape
+
+The same placement rule works when there are several requesters or receivers:
+
+```mermaid
+flowchart LR
+  caller_a["Caller A"] --> req_a["requester A"]
+  caller_b["Caller B"] --> req_b["requester B"]
+  caller_c["Caller C"] --> req_c["requester C"]
+  caller_d["Caller D"] --> req_d["requester D"]
+  caller_e["Caller E"] --> req_e["requester E"]
+
+  nats["NATS<br/>request/session-open distribution"]
+
+  subgraph requesters["Requester instances"]
+    req_a
+    req_b
+    req_c
+    req_d
+    req_e
+  end
+
+  subgraph receivers["Receiver pool"]
+    rec_1["receiver 1"]
+    rec_2["receiver 2"]
+    rec_3["receiver 3"]
+  end
+
+  req_a --> nats
+  req_b --> nats
+  req_c --> nats
+  req_d --> nats
+  req_e --> nats
+
+  nats -. "new flow can land on any receiver" .-> rec_1
+  nats -. "new flow can land on any receiver" .-> rec_2
+  nats -. "new flow can land on any receiver" .-> rec_3
+
+  rec_1 --> target["UPSTREAM_URL<br/>or TCP target"]
+  rec_2 --> target
+  rec_3 --> target
+```
+
+Requesters are not usually a pool for each other. They are the endpoints your callers use. You can run one requester per application, per host, per tenant, or behind your own load balancer.
+
+Receivers can form a worker pool. NATS distributes only the initial HTTP request or tunnel session open, so the pool size does not need to match the requester count. After a receiver is selected, streaming chunks, TCP tunnel bytes, and owner-addressed cancellation stay routed between the original requester and that selected receiver.
+
+For that to stay unambiguous, live requester and receiver instances should use stable, unique `SERVICE_ID` values. In Core NATS, receiver replicas share `NATS_QUEUE_GROUP`. In JetStream, receiver replicas share the request `NATS_CONSUMER_NAME`.
+
 ## What Changes Between Topologies
 
 Different deployments usually change only these things:

@@ -86,6 +86,9 @@ The same container image runs on both sides. The role only decides which side of
 
 The client does not need to know about NATS. Between `requester` and `receiver`, the only required path is NATS.
 
+You can run more than one requester or receiver. Requesters are the entry points chosen by your clients or platform, while receivers can form a worker pool on the outbound side.
+NATS balances only the beginning of each request or tunnel session; after a receiver starts handling a flow, the rest of that flow is routed between the original requester and the selected receiver.
+
 > [!NOTE]
 > The NATS bus can be an existing shared NATS deployment. The runtime image can also start an embedded `nats-server` when you want the two sides connected with NATS leafnodes.
 
@@ -106,6 +109,7 @@ Clients can use the `nats-proxy` endpoint in these ways:
 ## Capabilities
 
 - Core NATS and JetStream backends.
+- Multi-instance requester/receiver topologies with receiver-balanced flow starts.
 - Binary-safe chunk transport using base64 when a response chunk is not valid UTF-8.
 - Best-effort stream cancellation when the downstream client disconnects.
 - Local observability UI and JSON APIs for flows, cases, metrics, and NATS runtime state.
@@ -157,6 +161,8 @@ The service can run on Core NATS or JetStream:
 
 For embedded deployments, the runtime image can start `nats-server` inside the container and generate a leafnode configuration from environment variables. For external deployments, point both roles at an existing NATS topology with `NATS_URL`.
 
+For multi-instance deployments, use stable and unique `SERVICE_ID` values for live requester and receiver processes. Core NATS receiver replicas should share the same queue group, and JetStream receiver replicas should share the same request consumer name so new work is distributed as a worker pool.
+
 ---
 
 ## Proxy Authentication
@@ -206,6 +212,7 @@ The variables below are the minimum set needed to understand and start the servi
 | Variable | Default | Description |
 |---|---|---|
 | `SERVICE_ROLE` | `receiver` if `UPSTREAM_URL` is set, else `requester` | Runtime role: `requester` or `receiver`. |
+| `SERVICE_ID` | `srv-<random>` | Stable instance identifier used in NATS subjects and observability. Use unique values for live multi-instance requesters and receivers. |
 | `UPSTREAM_URL` | unset | Receiver HTTP upstream base URL. |
 | `PORT` | `7000` in the Docker image | Rack/Falcon bind port. |
 | `NATS_URL` | `nats://localhost:4222` | NATS server URL used by the app process. |
@@ -291,4 +298,3 @@ docker network rm nats-proxy
 ```
 
 Both service containers disable proxy auth for this quick local run. Production proxy ingress should configure `PROXY_AUTH_USERS_JSON` instead of using `PROXY_AUTH_ENABLED=false`.
-

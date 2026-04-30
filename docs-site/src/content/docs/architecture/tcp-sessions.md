@@ -61,6 +61,8 @@ sequenceDiagram
 
 `TcpTunnelBridge#dispatch_connect_request` waits up to `NATS_RESPONSE_TIMEOUT` for `session_established`. If it does not arrive, the requester returns a session establishment timeout.
 
+`session_established` includes the receiver `SERVICE_ID` and the flow kind. The requester stores that owner id and uses it for all later upstream tunnel bytes and owner-scoped cancellation for the session.
+
 HTTP `CONNECT` requires Rack hijack support. The provided runtime uses Falcon because the tunnel needs direct access to the client socket after the HTTP 200 response.
 
 ## Data Flow
@@ -88,7 +90,7 @@ sequenceDiagram
   end
 ```
 
-The frame subjects are documented in [NATS Transport](nats-transport/). Session data messages carry `Nats-Session-Id` and `Nats-Frame-Type` headers. Downstream bytes are delivered to the requester's `RequestContext#tunnel_data_queue`.
+The frame subjects are documented in [NATS Transport](nats-transport/). After establishment, upstream bytes from the requester are published to the owner receiver scope, and downstream bytes from the receiver are published to the original requester scope. Session data messages carry `Nats-Session-Id` and `Nats-Frame-Type` headers. Downstream bytes are delivered to the requester's `RequestContext#tunnel_data_queue`.
 
 Requester and receiver chunk size is capped by the smaller of half the NATS max payload and the local default chunk size of 32 KiB.
 
@@ -120,4 +122,4 @@ Current close reasons include:
 | `cancel_requested` | Receiver observed cancellation while the session was active. |
 | `hijack_not_supported` | Requester could not access Rack hijack for HTTP `CONNECT`. |
 
-If the requester writer loop times out while waiting for downstream tunnel data or control events, it publishes a cancel request with reason `stream_timeout`. If the writer sees a `response_error`, it publishes cancellation with reason `upstream_error`.
+If the requester writer loop times out while waiting for downstream tunnel data or control events, it publishes a cancel request with reason `stream_timeout`. If the writer sees a `response_error`, it publishes cancellation with reason `upstream_error`. Once the receiver owner is known, these cancels go to the owner receiver cancel subject.

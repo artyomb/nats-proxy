@@ -73,6 +73,14 @@ curl -i http://127.0.0.1:17000/
 
 Expected result: both containers connect to the same external NATS server, requester publishes bridge requests, receiver forwards them to `UPSTREAM_URL`, and `/observability/cases` starts showing bridged requests after traffic reaches the requester.
 
+## Multi-Instance Notes
+
+You can run multiple requesters and receivers against the same external NATS server. Each live process needs a unique `SERVICE_ID`.
+
+Additional requester instances expose additional ingress points; clients or the platform decide which requester receives a client connection. Additional receiver instances can form a worker pool for new bridge requests and tunnel session opens.
+
+For Core NATS, receiver replicas that should share new work must use the same `LISTEN_SUBJECT` and `NATS_QUEUE_GROUP`. For JetStream, they must share the same request stream and base `NATS_CONSUMER_NAME`. NATS distributes only the beginning of each flow; after a receiver is selected, continuation messages go back to the original requester and the owner receiver.
+
 ## Docker Run
 
 Receiver:

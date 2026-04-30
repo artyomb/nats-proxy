@@ -54,7 +54,7 @@ flowchart TB
 
   subgraph receiver["receiver role"]
     direction TB
-    rec_listen["request + upstream session listeners"]
+    rec_listen["request + upstream session + cancel listeners"]
     rec_out["outbound HTTP / TCP"]
   end
 
@@ -68,7 +68,9 @@ The requester also listens for responses and downstream TCP frames that return t
 
 In the requester role, `BridgeCore` starts the response listener and downstream session listener. If `SOCKS5_ENABLED=true`, `ServiceRuntime` also starts `Socks5Server`.
 
-In the receiver role, `BridgeCore` starts the request listener and upstream session listener. HTTP requests are handled by `HttpGateway`; TCP sessions are handled by `TcpTunnelBridge`.
+In the receiver role, `BridgeCore` starts the request listener, upstream session listener, and owner-scoped cancel listener. HTTP requests are handled by `HttpGateway`; TCP sessions are handled by `TcpTunnelBridge`.
+
+When more than one requester or receiver instance is running, `BridgeCore` uses `SERVICE_ID` to keep flow continuation scoped to the original requester and the selected receiver.
 
 ## Component Responsibilities
 

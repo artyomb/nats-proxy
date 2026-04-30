@@ -12,6 +12,8 @@ description: What requester and receiver do in a nats-proxy bridge.
 
 In the normal bridge topology, the client talks to the requester. It does not need to know that NATS and a receiver exist behind the endpoint.
 
+Both roles can have multiple live instances. Multiple requesters give callers multiple entry points. Multiple receivers act as outbound workers for new bridge work.
+
 ## Runtime Selection
 
 `SERVICE_ROLE` explicitly selects the role. If it is not set, `src/config.ru` chooses:
@@ -28,8 +30,10 @@ This default is convenient for simple setups, but production deployments should 
 | Role | Runtime pieces |
 |---|---|
 | `requester` | Response listener, downstream TCP session listener, HTTP routes, `CONNECT` middleware, and optional SOCKS5 listener when `SOCKS5_ENABLED=true`. |
-| `receiver` | Request listener, upstream TCP session listener, `http_request` handler, and `tcp_stream` handler. |
+| `receiver` | Request listener, upstream TCP session listener, cancel listener, `http_request` handler, and `tcp_stream` handler. |
 
 The requester publishes work into NATS and waits for response events or downstream tunnel frames. The receiver consumes that work, performs outbound HTTP/TCP, and publishes the result back through NATS.
+
+NATS balances the start of a flow, not every message in the flow. A new HTTP request or tunnel session open can be handled by any receiver in the pool. Once the receiver publishes `response_start` or `session_established`, that receiver becomes the owner for the flow. Later stream cancellation and TCP session bytes are routed to that owner receiver, while responses and downstream tunnel bytes are routed back to the original requester.
 
 At the protocol level, plain HTTP and HTTP proxy traffic use the HTTP request path. HTTP `CONNECT` and SOCKS5 use the TCP tunnel path. The exact bridge operation names are described in [Bridge Protocol](../architecture/bridge-protocol/).
