@@ -37,14 +37,14 @@ RSpec.describe TcpTunnelBridge do
 
   it "returns 501 when rack hijack is unavailable after session establishment" do
     context = RequestContext.new(request_id: "sess-1")
-    context.response_queue.enqueue(BridgeProtocol.session_established_event(session_id: "sess-1").to_json)
+    context.response_queue.enqueue(BridgeProtocol.session_established_event(session_id: "sess-1", receiver_service_id: "receiver-1").to_json)
     allow(SecureRandom).to receive(:hex).and_return("sess-1")
     allow(core).to receive(:bridge_session_open).and_return(context)
 
     status, = bridge.dispatch_connect_request(env: { "REQUEST_URI" => "example.com:443" })
 
     expect(status).to eq(501)
-    expect(core).to have_received(:close_session).with("sess-1", reason: "hijack_not_supported")
+    expect(core).to have_received(:close_session).with("sess-1", reason: "hijack_not_supported", receiver_service_id: "receiver-1")
   end
 
   it "emits session_established for receiver-side happy path" do

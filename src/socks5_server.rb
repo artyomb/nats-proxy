@@ -95,6 +95,7 @@ class Socks5Server
       return
     end
 
+    context.receiver_service_id = established['receiver_service_id']
     send_reply(
       socket,
       REPLY_SUCCEEDED,

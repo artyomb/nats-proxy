@@ -24,16 +24,16 @@ class ObservabilityCollector
     )
   end
 
-  def record_cancel_published(request_id:, reason:, cancel_envelope: nil)
+  def record_cancel_published(request_id:, reason:, subject: nil, routing_mode: nil, cancel_envelope: nil)
     nats_payload = cancel_envelope ? encode_nats_wire(cancel_envelope) : nil
-    append_event('cancel_published', request_id:, subject: nil, meta: { reason: }, nats_payload:)
+    append_event('cancel_published', request_id:, subject:, meta: { reason:, routing_mode: }, nats_payload:)
   end
 
-  def record_cancel_observed(request_id:, reason:, source_service_id:, nats_body: nil)
+  def record_cancel_observed(request_id:, reason:, source_service_id:, subject: nil, nats_body: nil)
     append_event(
       'cancel_observed',
       request_id:,
-      subject: nil,
+      subject:,
       meta: { reason:, source_service_id: },
       nats_payload: encode_nats_wire(nats_body)
     )

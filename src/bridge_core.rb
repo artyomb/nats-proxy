@@ -62,6 +62,7 @@ class BridgeCore
     @dispatcher_task = nil
     @upstream_session_listener_task = nil
     @downstream_session_listener_task = nil
+    @cancel_listener_task = nil
     @session_barrier = Concurrent::AtomicReference.new(nil)
   end
 
@@ -142,8 +143,8 @@ class BridgeCore
     published
   end
 
-  def send_session_data(session_id, binary_data)
-    subject = session_upstream_subject(session_id)
+  def send_session_data(session_id, binary_data, receiver_service_id:)
+    subject = session_upstream_subject(receiver_service_id, session_id)
     @collector.record_session_chunk(request_id: session_id, subject:, direction: 'upstream')
     publish_message(binary_data, subject, headers: {
       'Nats-Session-Id' => session_id,
@@ -160,10 +161,10 @@ class BridgeCore
     })
   end
 
-  def close_session(session_id, reason: 'normal')
+  def close_session(session_id, reason: 'normal', receiver_service_id:)
     publish_message(
       BridgeProtocol.session_close_event(reason:).to_json,
-      session_upstream_subject(session_id),
+      session_upstream_subject(receiver_service_id, session_id),
       headers: {
         'Nats-Session-Id' => session_id,
         'Nats-Frame-Type' => 'session_close'
@@ -284,7 +285,7 @@ class BridgeCore
   end
 
   def start_upstream_session_listener(task:)
-    subject = "#{@request_subject_root}.sessions.upstream.>"
+    subject = upstream_session_listen_subject
 
     @upstream_session_listener_task = task.async(annotation: "bridge-upstream-session-listener-#{@service_id}") do |listener_task|
       with_reconnect_loop(listener_task, 'Upstream session data listener') do
@@ -311,7 +312,7 @@ class BridgeCore
   end
 
   def start_downstream_session_listener(task:)
-    subject = "#{@response_subject_root}.sessions.downstream.>"
+    subject = downstream_session_listen_subject
 
     @downstream_session_listener_task = task.async(annotation: "bridge-downstream-session-listener-#{@service_id}") do |listener_task|
       with_reconnect_loop(listener_task, 'Downstream session data listener') do
@@ -337,6 +338,33 @@ class BridgeCore
     end
   end
 
+  def start_cancel_listener(task:)
+    subject = cancel_listen_subject
+
+    @cancel_listener_task = task.async(annotation: "bridge-cancel-listener-#{@service_id}") do |listener_task|
+      with_reconnect_loop(listener_task, 'Cancel listener') do
+        if @nats_backend == :jetstream
+          run_pull_listener(
+            subject:,
+            stream: @nats_stream,
+            consumer_name: "#{@consumer_name}-cancel-#{@service_id}",
+            params: { config: { inactive_threshold: @stream_timeout + 60 } },
+            manual_ack: false,
+            stale_ack: true
+          ) { |msg| process_cancel_listener_message(msg) }
+        else
+          begin
+            sid = subscribe_core(subject) { |msg| process_cancel_listener_message(msg) }
+            LOGGER.info "Cancel listener active: backend=#{@nats_backend}, subject=#{subject}"
+            wait_until_canceled(listener_task)
+          ensure
+            unsubscribe_core(sid)
+          end
+        end
+      end
+    end
+  end
+
   def release_pending(request_id)
     @pending_requests.delete(request_id)
   end
@@ -348,6 +376,7 @@ class BridgeCore
     @dispatcher_task&.stop
     @upstream_session_listener_task&.stop
     @downstream_session_listener_task&.stop
+    @cancel_listener_task&.stop
     set_bridge_state(ready: false)
   end
 
@@ -371,12 +400,31 @@ class BridgeCore
     "#{@response_subject_root}.responses.#{@service_id}"
   end
 
-  def session_upstream_subject(session_id)
-    "#{@request_subject_root}.sessions.upstream.#{@service_id}.#{session_id}"
+  def session_upstream_subject(receiver_service_id, session_id)
+    receiver_id = receiver_service_id.to_s
+    raise ArgumentError, "Missing receiver_service_id for session_id=#{session_id}" if receiver_id.empty?
+
+    "#{@request_subject_root}.sessions.upstream.#{receiver_id}.#{session_id}"
   end
 
   def session_downstream_subject(target_service_id, session_id)
     "#{@response_subject_root}.sessions.downstream.#{target_service_id}.#{session_id}"
+  end
+
+  def upstream_session_listen_subject
+    "#{@request_subject_root}.sessions.upstream.#{@service_id}.>"
+  end
+
+  def downstream_session_listen_subject
+    "#{@response_subject_root}.sessions.downstream.#{@service_id}.>"
+  end
+
+  def subject_for_cancel(receiver_service_id, request_id)
+    "#{@request_subject_root}.cancel.#{receiver_service_id}.#{request_id}"
+  end
+
+  def cancel_listen_subject
+    "#{@request_subject_root}.cancel.#{@service_id}.>"
   end
 
   def publish_raw?
@@ -422,11 +470,19 @@ class BridgeCore
 
   def publish_cancel_signal(request_id, context, reason:)
     payload = BridgeProtocol.cancel_envelope(request_id:, service_id: @service_id, reason:)
+    routing_mode = 'fallback'
     subject = context.request_subject
-    raise ArgumentError, "Missing request subject for cancel request_id=#{request_id}" if subject.to_s.empty?
+
+    unless context.receiver_service_id.to_s.empty?
+      routing_mode = 'owner'
+      subject = subject_for_cancel(context.receiver_service_id, request_id)
+    end
+
+    raise ArgumentError, "Missing cancel subject for request_id=#{request_id}" if subject.to_s.empty?
 
     publish_message(payload, subject)
-    @collector.record_cancel_published(request_id:, reason:, cancel_envelope: payload)
+    @collector.record_cancel_published(request_id:, reason:, subject:, routing_mode:, cancel_envelope: payload)
+    LOGGER.info "Published cancel signal: request_id=#{request_id}, subject=#{subject}, routing_mode=#{routing_mode}, backend=#{@nats_backend}"
     true
   rescue => e
     LOGGER.error "Failed to publish cancel signal: request_id=#{request_id}, reason=#{reason}, error=#{e.class} - #{e.message}"
@@ -478,14 +534,21 @@ class BridgeCore
       return
     end
 
-    LOGGER.info "Receiver cancel observed: request_id=#{cancel[:request_id]}, reason=#{cancel[:reason]}, source_service_id=#{cancel[:service_id]}, backend=#{@nats_backend}"
+    LOGGER.info "Receiver cancel observed: request_id=#{cancel[:request_id]}, reason=#{cancel[:reason]}, source_service_id=#{cancel[:service_id]}, subject=#{subject}, backend=#{@nats_backend}"
     @collector.record_cancel_observed(
       request_id: cancel[:request_id],
       reason: cancel[:reason],
       source_service_id: cancel[:service_id],
+      subject:,
       nats_body: raw
     )
     true
+  end
+
+  def process_cancel_listener_message(msg)
+    process_cancel_message(parse_bridge_message(msg), subject: msg.subject, raw: msg.data)
+  rescue JSON::ParserError
+    LOGGER.warn "Ignoring invalid cancel JSON: subject=#{msg.subject}, backend=#{@nats_backend}"
   end
 
   def reject_invalid_request(reply_to, error:, status: 400, nats_headers: {})
@@ -613,7 +676,7 @@ class BridgeCore
 
       enriched =
         if [BridgeProtocol::RESPONSE_START, BridgeProtocol::SESSION_ESTABLISHED].include?(event['type'])
-          event.merge('receiver_service_id' => @service_id)
+          enrich_owner_event(event, request_id:, operation:, payload:)
         else
           event
         end
@@ -686,6 +749,21 @@ class BridgeCore
     else
       LOGGER.warn "Dropping session frame with unknown type: session_id=#{session_id}, frame_type=#{frame_type}, backend=#{@nats_backend}"
     end
+  end
+
+  def enrich_owner_event(event, request_id:, operation:, payload:)
+    enriched = event.merge('receiver_service_id' => @service_id)
+
+    case event['type']
+    when BridgeProtocol::RESPONSE_START
+      enriched['request_id'] = request_id.to_s
+      enriched['flow_kind'] = event['streaming'] ? 'http_stream' : operation.to_s
+    when BridgeProtocol::SESSION_ESTABLISHED
+      enriched['session_id'] = request_id.to_s if enriched['session_id'].to_s.empty?
+      enriched['flow_kind'] = payload['ingress_kind'].to_s == 'socks5' ? 'socks5_stream' : 'tcp_stream'
+    end
+
+    enriched
   end
 
   def start_receiver_progress_task(task, msg, interval:)

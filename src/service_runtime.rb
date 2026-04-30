@@ -90,6 +90,7 @@ class ServiceRuntime
     when :receiver
       @core.start_request_listener(task:)
       @core.start_upstream_session_listener(task:)
+      @core.start_cancel_listener(task:)
     when :requester
       @core.start_response_listener(task:)
       @core.start_downstream_session_listener(task:)

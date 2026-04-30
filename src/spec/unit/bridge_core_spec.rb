@@ -129,10 +129,37 @@ RSpec.describe BridgeCore do
     core = build_core(nats_client: client)
     context = RequestContext.new(request_id: "req-3")
     context.request_subject = "to.proxy.requests.srv-test.req-3"
+    context.receiver_service_id = "receiver-1"
 
     expect(core.cancel_request(context, reason: "downstream_disconnect")).to be(true)
     expect(core.cancel_request(context, reason: "downstream_disconnect")).to be(false)
     expect(client.published.count { |publish| publish[:message].is_a?(Hash) && publish[:message]["type"] == "cancel" }).to eq(1)
+    expect(client.published.first[:subject]).to eq("to.proxy.cancel.receiver-1.req-3")
+  end
+
+  it "falls back to the original request subject for early cancel before owner selection" do
+    client = FakeNatsClient.new
+    core = build_core(nats_client: client)
+    context = RequestContext.new(request_id: "req-early")
+    context.request_subject = "to.proxy.requests.srv-test.req-early"
+
+    expect(core.cancel_request(context, reason: "downstream_disconnect")).to be(true)
+    expect(client.published.first[:subject]).to eq("to.proxy.requests.srv-test.req-early")
+  end
+
+  it "publishes upstream session frames to the owner receiver scope" do
+    client = FakeNatsClient.new
+    core = build_core(nats_client: client)
+
+    core.send_session_data("sess-1", "ping".b, receiver_service_id: "receiver-1")
+    core.close_session("sess-1", reason: "client_closed", receiver_service_id: "receiver-1")
+
+    expect(client.published.map { |publish| publish[:subject] }).to eq([
+      "to.proxy.sessions.upstream.receiver-1.sess-1",
+      "to.proxy.sessions.upstream.receiver-1.sess-1"
+    ])
+    expect(client.published.first[:headers]).to include("Nats-Frame-Type" => "session_data")
+    expect(client.published.last[:headers]).to include("Nats-Frame-Type" => "session_close")
   end
 
   it "routes downstream session data into the tunnel queue" do
@@ -325,7 +352,11 @@ RSpec.describe BridgeCore do
     published_messages = decode_published_messages(client)
 
     expect(published_messages.map { |event| event["type"] }).to eq(%w[response_start response_error response_end])
-    expect(published_messages.first).to include("receiver_service_id" => "srv-test")
+    expect(published_messages.first).to include(
+      "receiver_service_id" => "srv-test",
+      "request_id" => "req-http-cancel",
+      "flow_kind" => "http_request"
+    )
     expect(published_messages[1]["error"]).to eq("stream canceled: cancel_requested")
   end
 
@@ -361,7 +392,8 @@ RSpec.describe BridgeCore do
     expect(published_messages.map { |event| event["type"] }).to eq(%w[session_established session_close])
     expect(published_messages.first).to include(
       "session_id" => "sess-cancel",
-      "receiver_service_id" => "srv-test"
+      "receiver_service_id" => "srv-test",
+      "flow_kind" => "tcp_stream"
     )
     expect(published_messages.last).to include("reason" => "cancel_requested")
   end

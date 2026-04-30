@@ -76,12 +76,13 @@ module BridgeProtocol
     { 'type' => RESPONSE_ERROR, 'error' => message.to_s }
   end
 
-  def session_established_event(session_id:, receiver_service_id: nil, bind_host: nil, bind_port: nil, ingress_kind: nil)
+  def session_established_event(session_id:, receiver_service_id: nil, flow_kind: nil, bind_host: nil, bind_port: nil, ingress_kind: nil)
     event = {
       'type' => SESSION_ESTABLISHED,
       'session_id' => session_id.to_s
     }
     event['receiver_service_id'] = receiver_service_id if receiver_service_id
+    event['flow_kind'] = flow_kind if flow_kind
     event['bind_host'] = bind_host if bind_host
     event['bind_port'] = bind_port.to_i if bind_port
     event['ingress_kind'] = ingress_kind if ingress_kind

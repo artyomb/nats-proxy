@@ -63,7 +63,7 @@ class TcpTunnelBridge
     context.receiver_service_id = established['receiver_service_id']
     hijack = env['rack.hijack']
     unless hijack.respond_to?(:call)
-      @core.close_session(session_id, reason: 'hijack_not_supported')
+      @core.close_session(session_id, reason: 'hijack_not_supported', receiver_service_id: context.receiver_service_id)
       @core.release_pending(session_id)
       return [501, { 'content-type' => 'text/plain' }, ['CONNECT tunneling requires rack.hijack support']]
     end
@@ -252,11 +252,11 @@ class TcpTunnelBridge
         break unless bytes
         next if bytes.empty?
 
-        @core.send_session_data(session_id, bytes)
+        @core.send_session_data(session_id, bytes, receiver_service_id: context.receiver_service_id)
       end
-      @core.close_session(session_id, reason: 'client_closed')
+      @core.close_session(session_id, reason: 'client_closed', receiver_service_id: context.receiver_service_id)
     rescue IOError, Errno::ECONNRESET, Errno::EPIPE
-      @core.close_session(session_id, reason: 'client_disconnected')
+      @core.close_session(session_id, reason: 'client_disconnected', receiver_service_id: context.receiver_service_id)
     ensure
       stop = true
     end

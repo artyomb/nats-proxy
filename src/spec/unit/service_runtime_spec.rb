@@ -39,6 +39,7 @@ RSpec.describe ServiceRuntime do
       start_downstream_session_listener: nil,
       start_request_listener: nil,
       start_upstream_session_listener: nil,
+      start_cancel_listener: nil,
       bridge_inbound?: false,
       bridge_outbound?: true,
       close: true
