@@ -69,6 +69,38 @@ RSpec.describe BridgeProtocol do
     end
   end
 
+  describe ".flow_credit_payload and .parse_flow_credit_payload" do
+    it "builds and parses flow credit frames" do
+      payload = described_class.flow_credit_payload(
+        request_id: "req-1",
+        service_id: "srv-1",
+        direction: described_class::DIRECTION_RESPONSE,
+        bytes: "128",
+        timestamp: "2026-05-15T00:00:00Z"
+      )
+
+      expect(payload).to eq(
+        "type" => "flow_credit",
+        "request_id" => "req-1",
+        "direction" => "response",
+        "bytes" => 128,
+        "service_id" => "srv-1",
+        "timestamp" => "2026-05-15T00:00:00Z"
+      )
+      expect(described_class.parse_flow_credit_payload(payload.to_json)).to include(
+        "request_id" => "req-1",
+        "direction" => "response",
+        "bytes" => 128
+      )
+    end
+
+    it "rejects invalid flow credit payloads" do
+      expect(described_class.parse_flow_credit_payload({ "type" => "flow_credit", "request_id" => "req-1", "direction" => "bad", "bytes" => 1 }.to_json)).to be_nil
+      expect(described_class.parse_flow_credit_payload({ "type" => "flow_credit", "request_id" => "req-1", "direction" => "response", "bytes" => 0 }.to_json)).to be_nil
+      expect(described_class.parse_flow_credit_payload("not-json")).to be_nil
+    end
+  end
+
   describe ".normalize_headers" do
     it "downcases keys and preserves array values" do
       expect(described_class.normalize_headers("Set-Cookie" => ["a=1", "b=2"], "X-Id" => 10))

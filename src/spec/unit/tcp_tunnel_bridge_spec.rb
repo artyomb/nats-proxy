@@ -14,6 +14,8 @@ RSpec.describe TcpTunnelBridge do
       close_session: nil,
       send_session_data: nil,
       send_session_downstream: nil,
+      send_session_credit_downstream: nil,
+      send_session_credit_upstream: nil,
       cancel_request: nil
     )
   end
@@ -65,5 +67,47 @@ RSpec.describe TcpTunnelBridge do
 
     expect(outcome).to eq(BridgeProtocol::OUTCOME_COMPLETED)
     expect(events.first).to include("type" => "session_established", "session_id" => "sess-2", "bind_port" => 12345)
+    expect(core).to have_received(:send_session_credit_upstream).with("sess-2", "srv-requester", 1_048_576)
+  end
+
+  it "returns downstream credit only after writing tunnel data to the client" do
+    context = RequestContext.new(request_id: "sess-down")
+    context.receiver_service_id = "receiver-1"
+    context.tunnel_data_queue = Async::Queue.new
+    context.tunnel_data_queue.enqueue("abc")
+    context.response_queue.enqueue(BridgeProtocol.session_close_event(reason: "target_closed"))
+    client_io = StringIO.new
+
+    Sync do
+      expect(bridge.send(:tunnel_writer_loop, client_io, context)).to eq(:finished)
+    end
+
+    expect(client_io.string).to eq("abc")
+    expect(core).to have_received(:send_session_credit_downstream).with("sess-down", "receiver-1", 3)
+  end
+
+  it "does not close a CONNECT tunnel just because downstream data is temporarily idle" do
+    context = RequestContext.new(request_id: "sess-idle")
+    context.receiver_service_id = "receiver-1"
+    context.tunnel_data_queue = Async::Queue.new
+    client_io = StringIO.new
+
+    Sync do |task|
+      finished = false
+      cancel = false
+      runner = task.async do
+        bridge.send(:tunnel_writer_loop, client_io, context, cancel_check: -> { cancel })
+        finished = true
+      end
+
+      expect do
+        task.with_timeout(0.2) { runner.wait }
+      end.to raise_error(Async::TimeoutError)
+      expect(finished).to be(false)
+
+      cancel = true
+      runner.wait
+      expect(finished).to be(true)
+    end
   end
 end

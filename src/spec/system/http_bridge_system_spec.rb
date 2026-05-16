@@ -1,3 +1,4 @@
+require "digest"
 require_relative "../spec_helper"
 
 RSpec.describe "HTTP bridge system", :system do
@@ -306,6 +307,62 @@ RSpec.describe "HTTP bridge system", :system do
     socket&.close unless socket&.closed?
     upstream&.stop
   end
+
+  shared_examples "large streaming response bridge flow" do |mode|
+    it "streams a response larger than the initial credit window in #{mode} mode" do
+      upstream = SystemHttpServer.new
+      socket = nil
+      marker = "END-FLOW\n"
+      payload = 20.times.map { |index| "flow-#{format('%04d', index)}:" + ("x" * 65_520) }.join << marker
+
+      upstream.on("/large-flow") do |request|
+        request.socket.write("HTTP/1.1 200 OK\r\n")
+        request.socket.write("Content-Type: application/x-ndjson\r\n")
+        request.socket.write("Connection: close\r\n\r\n")
+        payload.bytes.each_slice(65_536) do |slice|
+          request.socket.write(slice.pack("C*"))
+          request.socket.flush
+        end
+        :handled
+      end
+
+      with_service_cluster(mode:, upstream_url: upstream.base_url, stream_timeout: 5) do |cluster|
+        socket = open_http_socket(
+          host: "127.0.0.1",
+          port: cluster.fetch(:requester).port,
+          request_text: "GET /large-flow HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n"
+        )
+
+        head, body = read_http_response(socket)
+
+        expect(head).to include("HTTP/1.1 200")
+        expect(head).to include("application/x-ndjson")
+        expect(body.bytesize).to eq(payload.bytesize)
+        expect(Digest::SHA256.hexdigest(body)).to eq(Digest::SHA256.hexdigest(payload))
+
+        event_case = observability_case_for(cluster.fetch(:requester_url), path: "/large-flow", outcome: "success")
+        expect(event_case.fetch("credits_total")).to be > 1
+        expect(event_case.fetch("credit_bytes_total")).to be >= payload.bytesize
+        expect(event_case.fetch("flow_timeouts_total")).to eq(0)
+
+        receiver_events = wait_until(timeout: 5) do
+          events = observability_flow_events(cluster.fetch(:receiver_url), request_id: event_case.fetch("request_id"), limit: 200)
+          events if events.any? { |event| event["type"] == "flow_credit_received" && event.dig("meta", "direction") == "response" }
+        rescue JSON::ParserError
+          nil
+        end
+        expect(receiver_events.any? { |event| event["type"] == "flow_credit_timeout" }).to be(false)
+
+        socket.close
+      end
+    ensure
+      socket&.close unless socket&.closed?
+      upstream&.stop
+    end
+  end
+
+  include_examples "large streaming response bridge flow", :core
+  include_examples "large streaming response bridge flow", :jetstream
 
   it "streams NDJSON responses through requester and receiver until normal completion" do
     upstream = SystemHttpServer.new

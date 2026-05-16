@@ -1,3 +1,4 @@
+require "digest"
 require_relative "../spec_helper"
 
 RSpec.describe "CONNECT tunnel system", :system do
@@ -61,6 +62,7 @@ RSpec.describe "CONNECT tunnel system", :system do
 
         expect(cases.fetch("streaming")).to eq(false)
         expect(cases.fetch("subject")).to include(".requests.")
+        expect(cases.fetch("credits_total")).to be > 0
       end
     ensure
       upstream&.stop
@@ -120,6 +122,58 @@ RSpec.describe "CONNECT tunnel system", :system do
 
   include_examples "CONNECT bridge flow", :core
   include_examples "CONNECT bridge flow", :jetstream
+
+  shared_examples "large CONNECT bridge flow" do |mode|
+    it "echoes a CONNECT payload larger than the initial credit window in #{mode} mode" do
+      upstream = SystemHttpServer.new
+      echo_server = SystemEchoServer.new
+      socket = nil
+      payload = 20.times.map { |index| "connect-flow-#{format('%04d', index)}:" + ("x" * 65_512) }.join
+
+      with_service_cluster(mode:, upstream_url: upstream.base_url, stream_timeout: 5) do |cluster|
+        socket = open_connect_tunnel(
+          host: "127.0.0.1",
+          port: cluster.fetch(:requester).port,
+          target: "127.0.0.1:#{echo_server.port}"
+        )
+
+        writer = Thread.new do
+          socket.write(payload)
+          socket.flush
+        end
+        echoed = read_socket_bytes(socket, bytes: payload.bytesize, timeout: 10, chunk_size: 8_192, pause: 0.002)
+        expect(writer.join(2)).to eq(writer)
+        socket.close
+
+        expect(echoed.bytesize).to eq(payload.bytesize)
+        expect(Digest::SHA256.hexdigest(echoed)).to eq(Digest::SHA256.hexdigest(payload))
+
+        event_case = observability_case_for(
+          cluster.fetch(:requester_url),
+          path: "127.0.0.1:#{echo_server.port}",
+          timeout: 10
+        )
+        expect(event_case.fetch("outcome")).not_to eq("timeout")
+
+        flow_events = wait_until(timeout: 5) do
+          events = observability_flow_events(cluster.fetch(:requester_url), request_id: event_case.fetch("request_id"), limit: 200)
+          directions = events.map { |event| event.dig("meta", "direction") }.compact
+          credit_bytes = events.sum { |event| %w[flow_credit_sent flow_credit_received].include?(event["type"]) ? event.dig("meta", "bytes").to_i : 0 }
+          events if directions.include?("upstream") && directions.include?("downstream") && credit_bytes >= payload.bytesize
+        rescue JSON::ParserError
+          nil
+        end
+        expect(flow_events.any? { |event| event["type"] == "flow_credit_timeout" }).to be(false)
+      end
+    ensure
+      socket&.close unless socket&.closed?
+      upstream&.stop
+      echo_server&.stop
+    end
+  end
+
+  include_examples "large CONNECT bridge flow", :core
+  include_examples "large CONNECT bridge flow", :jetstream
 
   it "rejects malformed CONNECT targets with HTTP 400" do
     upstream = SystemHttpServer.new

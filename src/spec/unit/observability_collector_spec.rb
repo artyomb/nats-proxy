@@ -1,4 +1,5 @@
 require_relative "../spec_helper"
+require_relative "../../nats_async_runtime"
 require_relative "../../observability_collector"
 
 RSpec.describe ObservabilityCollector do
@@ -22,6 +23,20 @@ RSpec.describe ObservabilityCollector do
     cancel_event = collector.flow_events("outcome" => "canceled").fetch(:events).find { |event| event[:request_id] == "req-cancel" }
     expect(cancel_event).to include(subject: "to.proxy.cancel.receiver-1.req-cancel")
     expect(collector.flow_events("outcome" => "timeout").fetch(:events).map { |event| event[:request_id] }).to include("req-timeout")
+  end
+
+  it "aggregates flow-control events in cases and metrics" do
+    collector.record_request_published(request_id: "req-flow", subject: "to.req-flow", method: "GET", path: "/stream")
+    collector.record_flow_credit_sent(request_id: "req-flow", subject: "to.proxy.control.receiver.req-flow", direction: "response", bytes: 100)
+    collector.record_flow_credit_received(request_id: "req-flow", subject: "to.proxy.control.receiver.req-flow", direction: "response", bytes: 100)
+    collector.record_flow_credit_wait(request_id: "req-flow", direction: "response")
+    collector.record_flow_credit_timeout(request_id: "req-flow", direction: "response")
+
+    row = collector.flow_cases("request_id" => "req-flow").fetch(:cases).first
+    metrics = collector.metrics
+
+    expect(row).to include(credits_total: 2, credit_bytes_total: 200, flow_waits_total: 1, flow_timeouts_total: 1)
+    expect(metrics.fetch(:flow_control)).to include(credits_total: 2, credit_bytes_total: 200, flow_waits_total: 1, flow_timeouts_total: 1)
   end
 
   it "includes jetstream inspection failure as structured observability output" do

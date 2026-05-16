@@ -71,7 +71,11 @@ RSpec.describe BridgeCore do
       record_response_event: nil,
       record_session_chunk: nil,
       record_cancel_published: nil,
-      record_cancel_observed: nil
+      record_cancel_observed: nil,
+      record_flow_credit_sent: nil,
+      record_flow_credit_received: nil,
+      record_flow_credit_wait: nil,
+      record_flow_credit_timeout: nil
     )
   end
 
@@ -162,6 +166,39 @@ RSpec.describe BridgeCore do
     expect(client.published.last[:headers]).to include("Nats-Frame-Type" => "session_close")
   end
 
+  it "publishes flow credit frames on owner-scoped subjects" do
+    client = FakeNatsClient.new
+    core = build_core(nats_client: client)
+
+    core.send_session_credit_downstream("sess-1", "receiver-1", 262_144)
+    core.send_session_credit_upstream("sess-1", "requester-1", 131_072)
+    core.send_response_credit("req-1", "receiver-1", 65_536)
+
+    expect(client.published.map { |publish| publish[:subject] }).to eq([
+      "to.proxy.sessions.upstream.receiver-1.sess-1",
+      "from.proxy.sessions.downstream.requester-1.sess-1",
+      "to.proxy.control.receiver-1.req-1"
+    ])
+    expect(client.published.map { |publish| publish[:headers]["Nats-Frame-Type"] }).to eq(
+      [
+        BridgeProtocol::FRAME_SESSION_CREDIT_DOWNSTREAM,
+        BridgeProtocol::FRAME_SESSION_CREDIT_UPSTREAM,
+        BridgeProtocol::FRAME_RESPONSE_CREDIT
+      ]
+    )
+    expect(decode_published_messages(client).map { |message| message["type"] }).to eq([BridgeProtocol::FLOW_CREDIT] * 3)
+  end
+
+  it "uses JetStream publish path for flow credit in jetstream mode" do
+    client = FakeNatsClient.new
+    core = build_core(backend: :jetstream, nats_client: client)
+
+    core.send_response_credit("req-1", "receiver-1", 65_536)
+
+    expect(client.published.first[:raw]).to eq(false)
+    expect(client.published.first[:subject]).to eq("to.proxy.control.receiver-1.req-1")
+  end
+
   it "routes downstream session data into the tunnel queue" do
     core = build_core
     context = RequestContext.new(request_id: "sess-1")
@@ -171,6 +208,56 @@ RSpec.describe BridgeCore do
     core.send(:dispatch_session_data, MessageDouble.new("pong".b, { "Nats-Frame-Type" => "session_data_downstream" }, nil, "from.proxy.sessions.downstream.srv-test.sess-1"))
 
     expect(context.tunnel_data_queue.dequeue(timeout: 0.1)).to eq("pong".b)
+  end
+
+  it "grants downstream and upstream session credits to the matching windows" do
+    core = build_core
+    active = RequestContext.new(request_id: "sess-credit", initial_state: "active")
+    pending = RequestContext.new(request_id: "sess-credit")
+    core.send(:attach_flow_windows, active)
+    core.send(:attach_flow_windows, pending)
+    core.instance_variable_get(:@active_streams)["sess-credit"] = active
+    core.instance_variable_get(:@pending_requests)["sess-credit"] = pending
+
+    down_credit = BridgeProtocol.flow_credit_payload(
+      request_id: "sess-credit",
+      service_id: "srv-test",
+      direction: BridgeProtocol::DIRECTION_DOWNSTREAM,
+      bytes: 123
+    ).to_json
+    up_credit = BridgeProtocol.flow_credit_payload(
+      request_id: "sess-credit",
+      service_id: "srv-test",
+      direction: BridgeProtocol::DIRECTION_UPSTREAM,
+      bytes: 456
+    ).to_json
+
+    core.send(:dispatch_session_data, MessageDouble.new(down_credit, { "Nats-Frame-Type" => BridgeProtocol::FRAME_SESSION_CREDIT_DOWNSTREAM }, nil, "to.proxy.sessions.upstream.srv-test.sess-credit"))
+    core.send(:dispatch_session_data, MessageDouble.new(up_credit, { "Nats-Frame-Type" => BridgeProtocol::FRAME_SESSION_CREDIT_UPSTREAM }, nil, "from.proxy.sessions.downstream.srv-test.sess-credit"))
+
+    Sync do
+      expect(active.downstream_credit_window.reserve(1_000, timeout: 0.1)).to eq(123)
+      expect(pending.upstream_credit_window.reserve(1_000, timeout: 0.1)).to eq(456)
+    end
+  end
+
+  it "grants HTTP response credit from the control listener path" do
+    core = build_core
+    context = RequestContext.new(request_id: "req-credit", initial_state: "active")
+    core.send(:attach_flow_windows, context)
+    core.instance_variable_get(:@active_streams)["req-credit"] = context
+    payload = BridgeProtocol.flow_credit_payload(
+      request_id: "req-credit",
+      service_id: "srv-test",
+      direction: BridgeProtocol::DIRECTION_RESPONSE,
+      bytes: 789
+    ).to_json
+
+    core.send(:process_control_message, MessageDouble.new(payload, { "Nats-Frame-Type" => BridgeProtocol::FRAME_RESPONSE_CREDIT }, nil, "to.proxy.control.srv-test.req-credit"))
+
+    Sync do
+      expect(context.response_credit_window.reserve(1_000, timeout: 0.1)).to eq(789)
+    end
   end
 
   it "dispatches cancel envelopes immediately without enqueueing a worker job" do

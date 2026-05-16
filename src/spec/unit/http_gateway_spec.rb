@@ -36,7 +36,7 @@ RSpec.describe HttpGateway do
   end
 
   let(:core) do
-    instance_double("BridgeCore", bridge_outbound?: false, bridge_request: nil, release_pending: nil, cancel_request: true)
+    instance_double("BridgeCore", bridge_outbound?: false, bridge_request: nil, release_pending: nil, cancel_request: true, send_response_credit: nil)
   end
 
   it "uses direct upstream when bridge listener is absent and upstream is configured" do
@@ -172,5 +172,92 @@ RSpec.describe HttpGateway do
 
     expect(outcome).to eq(BridgeProtocol::OUTCOME_UPSTREAM_ERROR)
     expect(events.map { |event| event["type"] }).to eq(%w[response_start response_chunk response_error response_end])
+  end
+
+  it "does not emit streaming response chunks before response credit is available" do
+    env = FakeEnv.new(200, { "Content-Type" => "text/event-stream" })
+    response = FakeResponse.new(200, { "Content-Type" => "text/event-stream" }, "")
+    connection = build_connection(response: response, chunks: [["data: a\n\n", env]])
+    gateway = described_class.new(
+      core: core,
+      upstream_url: nil,
+      nats_backend: :core,
+      service_id: "srv-test",
+      nats_response_timeout: 1,
+      stream_response_timeout: 1
+    )
+    window = FlowCreditWindow.new(max_bytes: 1024)
+    events = []
+
+    Sync do |task|
+      worker = task.async do
+        gateway.proxy_upstream_request(
+          connection: connection,
+          method: "GET",
+          path: "/stream",
+          request_id: "req-flow",
+          response_credit_window: window
+        ) { |event| events << event }
+      end
+      wait_until(timeout: 1) { events.any? }
+
+      expect(events.map { |event| event["type"] }).to eq(%w[response_start])
+      window.grant(32)
+      worker.wait
+    end
+
+    expect(events.map { |event| event["type"] }).to eq(%w[response_start response_chunk response_end])
+  end
+
+  it "reports streaming response credit timeouts as timeout outcomes" do
+    env = FakeEnv.new(200, { "Content-Type" => "text/event-stream" })
+    response = FakeResponse.new(200, { "Content-Type" => "text/event-stream" }, "")
+    connection = build_connection(response: response, chunks: [["data: a\n\n", env]])
+    gateway = described_class.new(
+      core: core,
+      upstream_url: nil,
+      nats_backend: :core,
+      service_id: "srv-test",
+      nats_response_timeout: 1,
+      stream_response_timeout: 0.01
+    )
+    window = FlowCreditWindow.new(max_bytes: 1024)
+    events = []
+
+    Sync do
+      outcome = gateway.proxy_upstream_request(
+        connection: connection,
+        method: "GET",
+        path: "/stream",
+        request_id: "req-flow-timeout",
+        response_credit_window: window
+      ) { |event| events << event }
+
+      expect(outcome).to eq(BridgeProtocol::OUTCOME_TIMEOUT)
+    end
+
+    expect(events.map { |event| event["type"] }).to eq(%w[response_start response_error response_end])
+  end
+
+  it "sends response credit after writing streaming chunks downstream" do
+    gateway = described_class.new(
+      core: core,
+      upstream_url: nil,
+      nats_backend: :core,
+      service_id: "srv-test",
+      nats_response_timeout: 1,
+      stream_response_timeout: 1
+    )
+    context = RequestContext.new(request_id: "req-stream")
+    context.receiver_service_id = "receiver-1"
+    context.response_queue.enqueue({ "type" => "response_start", "status" => 200, "headers" => { "content-type" => "text/event-stream" }, "content_type" => "text/event-stream", "streaming" => true, "receiver_service_id" => "receiver-1" })
+    context.response_queue.enqueue(BridgeProtocol.chunk_event("data: one\n\n"))
+    context.response_queue.enqueue(BridgeProtocol.end_event)
+
+    app = FakeRackApp.new(request: FakeRackRequest.new(method: "GET", path: "/stream"))
+    gateway.send(:render_response, app: app, context: context)
+
+    expect(core).to have_received(:send_response_credit).with("req-stream", "receiver-1", 1_048_576)
+    expect(core).to have_received(:send_response_credit).with("req-stream", "receiver-1", "data: one\n\n".bytesize)
   end
 end

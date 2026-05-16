@@ -1,4 +1,7 @@
 require_relative "../spec_helper"
+require_relative "../../bridge_core"
+require_relative "../../proxy_auth"
+require_relative "../../tcp_tunnel_bridge"
 require_relative "../../socks5_server"
 
 RSpec.describe Socks5Server do

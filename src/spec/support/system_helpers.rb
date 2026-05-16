@@ -287,6 +287,45 @@ module SystemHelpers
     socket.close unless socket.closed?
   end
 
+  def read_socket_until(socket, includes:, timeout: 5, chunk_size: 16_384, pause: 0)
+    body = +""
+    Timeout.timeout(timeout) do
+      until body.include?(includes)
+        body << socket.readpartial(chunk_size)
+        sleep pause if pause.positive?
+      end
+    end
+    body
+  end
+
+  def read_socket_bytes(socket, bytes:, timeout: 5, chunk_size: 16_384, pause: 0)
+    body = +""
+    Timeout.timeout(timeout) do
+      while body.bytesize < bytes
+        body << socket.readpartial([chunk_size, bytes - body.bytesize].min)
+        sleep pause if pause.positive?
+      end
+    end
+    body
+  end
+
+  def observability_case_for(base_url, path:, outcome: nil, timeout: 5, limit: 20)
+    wait_until(timeout:) do
+      payload = http_get_json(base_url, "/observability/cases?limit=#{limit}")
+      payload.fetch("cases").find do |item|
+        item["path"] == path && (outcome.nil? || item["outcome"] == outcome)
+      end
+    rescue JSON::ParserError
+      nil
+    end
+  end
+
+  def observability_flow_events(base_url, request_id:, event_type: nil, limit: 200)
+    params = { request_id:, limit: }
+    params[:event_type] = event_type if event_type
+    http_get_json(base_url, "/observability/flows?#{URI.encode_www_form(params)}").fetch("events")
+  end
+
   def parse_http_headers(head)
     head.lines.drop(1).each_with_object({}) do |line, memo|
       stripped = line.strip
