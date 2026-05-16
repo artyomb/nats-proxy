@@ -67,7 +67,7 @@ HTTP `CONNECT` requires Rack hijack support. The provided runtime uses Falcon be
 
 ## Data Flow
 
-Once established, both sides run reader and writer loops.
+Once established, both sides run reader and writer loops. Each direction is credit controlled: the side that wants to publish tunnel bytes must reserve credit first, and the receiving side returns credit after it successfully writes bytes to its local socket.
 
 ```mermaid
 sequenceDiagram
@@ -78,25 +78,33 @@ sequenceDiagram
   participant Target as TCP target
 
   par client to target
+    Rec-->>NATS: initial upstream credit
+    NATS-->>Req: upstream credit
     Client->>Req: bytes
     Req->>NATS: upstream session_data
     NATS->>Rec: upstream frame
     Rec->>Target: bytes
+    Rec-->>NATS: more upstream credit after target write
   and target to client
+    Req-->>NATS: initial downstream credit
+    NATS-->>Rec: downstream credit
     Target-->>Rec: bytes
     Rec-->>NATS: downstream session_data
     NATS-->>Req: downstream frame
     Req-->>Client: bytes
+    Req-->>NATS: more downstream credit after client write
   end
 ```
 
 The frame subjects are documented in [NATS Transport](nats-transport/). After establishment, upstream bytes from the requester are published to the owner receiver scope, and downstream bytes from the receiver are published to the original requester scope. Session data messages carry `Nats-Session-Id` and `Nats-Frame-Type` headers. Downstream bytes are delivered to the requester's `RequestContext#tunnel_data_queue`.
 
-Requester and receiver chunk size is capped by the smaller of half the NATS max payload and the local default chunk size of 32 KiB.
+Requester and receiver chunk size is capped by the smaller of half the NATS max payload and the local default chunk size of 32 KiB. With the default chunk size, each direction starts with a 1 MiB credit window and returns credit in 256 KiB batches after socket writes.
+
+Session data and session credit share the same owner-scoped session subjects. `Nats-Frame-Type=session_data` and `session_data_downstream` carry bytes. `session_credit_upstream` and `session_credit_downstream` carry JSON `flow_credit` payloads.
 
 ## Close And Timeout
 
-The tunnel closes when either side sees EOF, a write failure, a session close frame, cancellation, or `STREAM_RESPONSE_TIMEOUT`.
+The tunnel closes when either side sees EOF, a write failure, a session close frame, cancellation, or a flow-credit wait timeout. An idle tunnel is allowed to stay open while both sockets remain open; it is not closed merely because no data frames arrive for `STREAM_RESPONSE_TIMEOUT`.
 
 ```mermaid
 sequenceDiagram
@@ -120,6 +128,7 @@ Current close reasons include:
 | `client_disconnected` | Requester read loop hit a socket error. |
 | `target_closed` | Receiver target socket closed normally. |
 | `cancel_requested` | Receiver observed cancellation while the session was active. |
+| `flow_credit_timeout` | A reader could not reserve credit before the flow-credit wait timeout. |
 | `hijack_not_supported` | Requester could not access Rack hijack for HTTP `CONNECT`. |
 
-If the requester writer loop times out while waiting for downstream tunnel data or control events, it publishes a cancel request with reason `stream_timeout`. If the writer sees a `response_error`, it publishes cancellation with reason `upstream_error`. Once the receiver owner is known, these cancels go to the owner receiver cancel subject.
+If the requester writer sees a `response_error`, it publishes cancellation with reason `upstream_error`. If the client disconnects while the requester is writing downstream bytes, it publishes cancellation with reason `downstream_disconnect`. Once the receiver owner is known, these cancels go to the owner receiver cancel subject.
