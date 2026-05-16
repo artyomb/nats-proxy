@@ -27,7 +27,7 @@ This page lists environment variables read by the Ruby app, Docker runtime image
 | `NATS_STREAM` | `proxy` | both | JetStream mode | JetStream stream used by pull consumers and JetStream publishes. | `proxy` |
 | `NATS_CONSUMER_NAME` | `nats-proxy` | both | No | Base durable consumer name. JetStream receiver replicas that share work use the same base request consumer; requester response/session consumers add service-specific suffixes. | `nats-proxy` |
 | `NATS_QUEUE_GROUP` | value of `NATS_CONSUMER_NAME` | receiver | Core NATS mode | Queue group for the receiver request subscription. Core receiver replicas that share work use the same value. | `receivers` |
-| `NATS_REQUEST_SUBJECT_ROOT` | `to.proxy` | both | No | Root for request, upstream session, and cancel subjects. | `to.proxy` |
+| `NATS_REQUEST_SUBJECT_ROOT` | `to.proxy` | both | No | Root for request, upstream session, HTTP response credit, and cancel subjects. | `to.proxy` |
 | `NATS_RESPONSE_SUBJECT_ROOT` | `from.proxy` | both | No | Root for response and downstream session subjects. | `from.proxy` |
 | `LISTEN_SUBJECT` | `<request_root>.requests.>` | receiver | No | Receiver subscription filter for bridge request envelopes. Receiver replicas in the same pool use the same value. | `to.proxy.requests.>` |
 | `NATS_JS_API_PREFIX` | `$JS.API`, or resolved from embedded NATS domain | both | No | JetStream API prefix. Embedded mode exports the resolved value after starting `nats-server`. | `$JS.DOMAIN.API` |
@@ -43,7 +43,7 @@ This page lists environment variables read by the Ruby app, Docker runtime image
 | Variable | Default | Applies to | Required when | Description | Example |
 |---|---|---|---|---|---|
 | `NATS_RESPONSE_TIMEOUT` | `30` | requester | No | Timeout waiting for `response_start` or `session_established`. | `30` |
-| `STREAM_RESPONSE_TIMEOUT` | `30` | requester | No | Idle timeout between response events or tunnel frames after a response/session starts. | `30` |
+| `STREAM_RESPONSE_TIMEOUT` | `30` | both | No | Timeout for waiting on streaming response events and for flow-credit waits in HTTP streams and TCP tunnels. Idle TCP tunnels are not closed only because no data frames arrive. | `30` |
 | `RECEIVER_MAX_INFLIGHT` | `20` | receiver | No | Receiver dispatch concurrency. Internal queue size is twice this value. | `20` |
 
 ## Proxy And SOCKS5 Ingress

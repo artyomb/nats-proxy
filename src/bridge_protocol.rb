@@ -19,6 +19,20 @@ module BridgeProtocol
   SESSION_ESTABLISHED = 'session_established'.freeze
   SESSION_CLOSE = 'session_close'.freeze
 
+  FLOW_CREDIT = 'flow_credit'.freeze
+  DIRECTION_UPSTREAM = 'upstream'.freeze
+  DIRECTION_DOWNSTREAM = 'downstream'.freeze
+  DIRECTION_RESPONSE = 'response'.freeze
+  FLOW_DIRECTIONS = [DIRECTION_UPSTREAM, DIRECTION_DOWNSTREAM, DIRECTION_RESPONSE].freeze
+
+  FRAME_SESSION_DATA = 'session_data'.freeze
+  FRAME_SESSION_DATA_UPSTREAM = 'session_data_upstream'.freeze
+  FRAME_SESSION_DATA_DOWNSTREAM = 'session_data_downstream'.freeze
+  FRAME_SESSION_CLOSE = 'session_close'.freeze
+  FRAME_SESSION_CREDIT_DOWNSTREAM = 'session_credit_downstream'.freeze
+  FRAME_SESSION_CREDIT_UPSTREAM = 'session_credit_upstream'.freeze
+  FRAME_RESPONSE_CREDIT = 'response_credit'.freeze
+
   class ProtocolError < StandardError; end
   class InvalidRequestError < ArgumentError; end
 
@@ -33,6 +47,7 @@ module BridgeProtocol
 
   class UpstreamUnavailableError < StandardError; end
   class StreamCanceledError < StandardError; end
+  class FlowCreditTimeoutError < StandardError; end
 
   module_function
 
@@ -91,6 +106,39 @@ module BridgeProtocol
 
   def session_close_event(reason: 'normal')
     { 'type' => SESSION_CLOSE, 'reason' => reason.to_s }
+  end
+
+  def flow_credit_payload(request_id:, service_id:, direction:, bytes:, timestamp: nil)
+    amount = bytes.to_i
+    raise ArgumentError, 'Invalid flow credit bytes' if amount <= 0
+
+    direction = direction.to_s
+    raise ArgumentError, "Invalid flow credit direction=#{direction}" unless FLOW_DIRECTIONS.include?(direction)
+
+    {
+      'type' => FLOW_CREDIT,
+      'request_id' => request_id.to_s,
+      'direction' => direction,
+      'bytes' => amount,
+      'service_id' => service_id.to_s,
+      'timestamp' => (timestamp || Time.now.utc.iso8601)
+    }
+  end
+
+  def parse_flow_credit_payload(payload)
+    data = parse_event(payload)
+    return nil unless data.is_a?(Hash) && data['type'] == FLOW_CREDIT
+
+    amount = data['bytes'].to_i
+    direction = data['direction'].to_s
+    request_id = data['request_id'].to_s
+    return nil if request_id.empty? || amount <= 0 || !FLOW_DIRECTIONS.include?(direction)
+
+    data.merge(
+      'request_id' => request_id,
+      'direction' => direction,
+      'bytes' => amount
+    )
   end
 
   def cancel_payload(request_id:, service_id:, reason:, timestamp: nil)

@@ -230,6 +230,7 @@ module NatsServerHelper
             { stream: "to.proxy.requests.>" }
             { stream: "to.proxy.sessions.upstream.>" }
             { stream: "to.proxy.cancel.>" }
+            { stream: "to.proxy.control.>" }
             { service: "_INBOX.>", accounts: [proxy] }
           ]
           imports: [
@@ -254,6 +255,7 @@ module NatsServerHelper
             { stream: { account: local, subject: "to.proxy.requests.>" }, to: "proxy.requests.>" }
             { stream: { account: local, subject: "to.proxy.sessions.upstream.>" }, to: "proxy.sessions.upstream.>" }
             { stream: { account: local, subject: "to.proxy.cancel.>" }, to: "proxy.cancel.>" }
+            { stream: { account: local, subject: "to.proxy.control.>" }, to: "proxy.control.>" }
             { service: { account: local, subject: "_INBOX.>" }, to: "_INBOX.>" }
           ]
           jetstream: enabled

@@ -11,6 +11,7 @@ This page is a maintainer map. Use it when you already know the service behavior
 | Boot lifecycle and role-specific listeners | `src/service_runtime.rb` | `src/spec/unit/service_runtime_spec.rb` |
 | NATS subjects, request dispatch, response/session listeners, JetStream consumers | `src/bridge_core.rb` | `src/spec/unit/bridge_core_spec.rb`, `src/spec/system/http_bridge_system_spec.rb` |
 | Protocol helpers and event parsing | `src/bridge_protocol.rb` | `src/spec/unit/bridge_protocol_spec.rb` |
+| Flow-credit window sizing and reservation | `src/flow_credit_window.rb` | `src/spec/unit/flow_credit_window_spec.rb` |
 | Per-request state, cancellation state, queues | `src/request_context.rb` | `src/spec/unit/request_context_spec.rb` |
 | HTTP forwarding and streaming response rendering | `src/http_gateway.rb` | `src/spec/unit/http_gateway_spec.rb`, `src/spec/system/http_bridge_system_spec.rb` |
 | CONNECT and bridged TCP sessions | `src/tcp_tunnel_bridge.rb` | `src/spec/unit/tcp_tunnel_bridge_spec.rb`, `src/spec/system/connect_tunnel_system_spec.rb` |

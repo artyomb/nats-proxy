@@ -1,3 +1,5 @@
+require_relative 'flow_credit_window'
+
 class ServiceRuntime
   BOOT_STATES = %i[idle booting ready failed stopped].freeze
 
@@ -91,6 +93,7 @@ class ServiceRuntime
       @core.start_request_listener(task:)
       @core.start_upstream_session_listener(task:)
       @core.start_cancel_listener(task:)
+      @core.start_control_listener(task:)
     when :requester
       @core.start_response_listener(task:)
       @core.start_downstream_session_listener(task:)
@@ -118,7 +121,8 @@ class ServiceRuntime
         response_timeout: @config.fetch(:nats_response_timeout),
         stream_timeout: @config.fetch(:stream_response_timeout),
         max_inflight: @config.fetch(:max_inflight),
-        queue_size: @config.fetch(:queue_size)
+        queue_size: @config.fetch(:queue_size),
+        **flow_window_config
       }
     )
   end
@@ -130,7 +134,10 @@ class ServiceRuntime
       nats_backend: @backend,
       service_id: @config.fetch(:service_id),
       nats_response_timeout: @config.fetch(:nats_response_timeout),
-      stream_response_timeout: @config.fetch(:stream_response_timeout)
+      stream_response_timeout: @config.fetch(:stream_response_timeout),
+      flow_initial_window_bytes: flow_window_config.fetch(:flow_initial_window_bytes),
+      flow_credit_batch_bytes: flow_window_config.fetch(:flow_credit_batch_bytes),
+      flow_credit_wait_timeout: flow_window_config.fetch(:flow_credit_wait_timeout)
     )
   end
 
@@ -141,8 +148,26 @@ class ServiceRuntime
       nats_backend: @backend,
       service_id: @config.fetch(:service_id),
       nats_response_timeout: @config.fetch(:nats_response_timeout),
-      stream_response_timeout: @config.fetch(:stream_response_timeout)
+      stream_response_timeout: @config.fetch(:stream_response_timeout),
+      flow_initial_window_bytes: flow_window_config.fetch(:flow_initial_window_bytes),
+      flow_credit_batch_bytes: flow_window_config.fetch(:flow_credit_batch_bytes),
+      flow_credit_wait_timeout: flow_window_config.fetch(:flow_credit_wait_timeout)
     )
+  end
+
+  def flow_window_config
+    @flow_window_config ||= begin
+      chunk_size = [@nats_service.max_payload.to_i / 2, TcpTunnelBridge::DEFAULT_CHUNK_SIZE].min
+      chunk_size = TcpTunnelBridge::DEFAULT_CHUNK_SIZE if chunk_size <= 0
+
+      {
+        flow_chunk_size: chunk_size,
+        flow_initial_window_bytes: FlowCreditWindow.default_initial_bytes(chunk_size:),
+        flow_credit_batch_bytes: FlowCreditWindow.default_batch_bytes(chunk_size:),
+        flow_max_window_bytes: FlowCreditWindow.default_max_bytes(chunk_size:),
+        flow_credit_wait_timeout: @config.fetch(:stream_response_timeout).to_f
+      }
+    end
   end
 
   def build_socks5_server

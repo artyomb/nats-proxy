@@ -7,6 +7,7 @@ require 'securerandom'
 require 'uri'
 require_relative 'request_context'
 require_relative 'bridge_protocol'
+require_relative 'flow_credit_window'
 
 class HttpGateway
   InvalidProxyTargetError = Class.new(ArgumentError)
@@ -32,13 +33,19 @@ class HttpGateway
     nats_backend:,
     service_id:,
     nats_response_timeout:,
-    stream_response_timeout:
+    stream_response_timeout:,
+    flow_initial_window_bytes: FlowCreditWindow.default_initial_bytes(chunk_size: 32_768),
+    flow_credit_batch_bytes: FlowCreditWindow.default_batch_bytes(chunk_size: 32_768),
+    flow_credit_wait_timeout: nil
   )
     @core = core
     @nats_backend = nats_backend
     @service_id = service_id
     @nats_response_timeout = nats_response_timeout
     @stream_response_timeout = stream_response_timeout
+    @flow_initial_window_bytes = flow_initial_window_bytes.to_i
+    @flow_credit_batch_bytes = flow_credit_batch_bytes.to_i
+    @flow_credit_wait_timeout = (flow_credit_wait_timeout || stream_response_timeout).to_f
     @upstream = build_upstream_connection(upstream_url)
   end
 
@@ -78,7 +85,7 @@ class HttpGateway
     render_response(app:, context:)
   end
 
-  def handle_bridge_request(payload:, cancel_check:, emit_failure_response:, request_id: nil, upstream_queue: nil)
+  def handle_bridge_request(payload:, cancel_check:, emit_failure_response:, request_id: nil, response_credit_window: nil)
     method = payload['method']
     path = payload['path']
     headers = payload['headers'] || {}
@@ -108,13 +115,15 @@ class HttpGateway
       headers:,
       body:,
       emit_failure_response:,
-      cancel_check:
+      cancel_check:,
+      request_id:,
+      response_credit_window:
     ) { |event| yield event }
   rescue InvalidProxyTargetError => e
     raise BridgeProtocol::InvalidRequestError, e.message
   end
 
-  def proxy_upstream_request(connection:, method:, path:, headers: {}, body: nil, emit_failure_response: true, cancel_check: nil)
+  def proxy_upstream_request(connection:, method:, path:, headers: {}, body: nil, emit_failure_response: true, cancel_check: nil, request_id: nil, response_credit_window: nil)
     raise ArgumentError, 'block required' unless block_given?
 
     state = { start_event: nil, streaming_started: false, buffered_chunks: [] }
@@ -141,7 +150,7 @@ class HttpGateway
             yield state[:start_event]
             state[:streaming_started] = true
           end
-          yield BridgeProtocol.chunk_event(chunk) unless chunk.empty?
+          emit_stream_chunk(chunk, request_id:, response_credit_window:, cancel_check:) { |event| yield event } unless chunk.empty?
         else
           state[:buffered_chunks] << chunk unless chunk.empty?
         end
@@ -167,6 +176,12 @@ class HttpGateway
     BridgeProtocol::OUTCOME_COMPLETED
   rescue BridgeProtocol::StreamCanceledError
     BridgeProtocol::OUTCOME_CANCELED
+  rescue BridgeProtocol::FlowCreditTimeoutError
+    if state[:streaming_started]
+      yield BridgeProtocol.error_event('Response flow credit timeout')
+      yield BridgeProtocol.end_event
+    end
+    BridgeProtocol::OUTCOME_TIMEOUT
   rescue Faraday::ConnectionFailed, Faraday::TimeoutError => e
     error_message = "Upstream unavailable: #{e.message}"
 
@@ -440,6 +455,7 @@ class HttpGateway
       apply_response_start_event(app, start_event)
       stream_content_type = start_event['content_type']
       disconnect_reason = nil
+      grant_initial_response_credit(context)
 
       disconnect = lambda do |reason|
         next if disconnect_reason
@@ -461,6 +477,7 @@ class HttpGateway
 
           begin
             out << chunk
+            return_response_credit(context, chunk.bytesize)
           rescue IOError, Errno::EPIPE, Errno::ECONNRESET => e
             disconnect.call(e.class.to_s)
             raise DownstreamDisconnectedError, e.message
@@ -488,6 +505,7 @@ class HttpGateway
         LOGGER.error "Bridge streaming protocol error: request_id=#{context.request_id}, error=#{e.message}"
         out << format_stream_error(e.message, content_type: stream_content_type)
       ensure
+        flush_response_credit(context)
         out.close
         LOGGER.info "Stream finalized: request_id=#{context.request_id}, outcome=#{context.outcome}, receiver_service_id=#{context.receiver_service_id || '-'}, cancel_reason=#{context.cancel_reason || '-'}, backend=#{@nats_backend}"
         release_context(context)
@@ -522,4 +540,77 @@ class HttpGateway
   def extract_status(env) = env.status
 
   def extract_headers(env) = env.response_headers
+
+  def emit_stream_chunk(chunk, request_id:, response_credit_window:, cancel_check:)
+    unless response_credit_window
+      yield BridgeProtocol.chunk_event(chunk)
+      return
+    end
+
+    bytes = chunk.to_s.b
+    offset = 0
+    while offset < bytes.bytesize
+      reserved = reserve_response_credit(response_credit_window, request_id:, bytes: bytes.bytesize - offset, cancel_check:)
+      raise BridgeProtocol::FlowCreditTimeoutError, 'response flow credit timeout' if reserved == FlowCreditWindow::TIMEOUT
+      return unless reserved
+
+      part = bytes.byteslice(offset, reserved)
+      yield BridgeProtocol.chunk_event(part)
+      offset += reserved
+    end
+  end
+
+  def reserve_response_credit(window, request_id:, bytes:, cancel_check:)
+    return true unless window
+
+    result = window.reserve(
+      bytes,
+      timeout: @flow_credit_wait_timeout,
+      cancel_check:,
+      on_wait: -> { record_flow_credit_wait(request_id, BridgeProtocol::DIRECTION_RESPONSE) }
+    )
+    if result == FlowCreditWindow::TIMEOUT
+      record_flow_credit_timeout(request_id, BridgeProtocol::DIRECTION_RESPONSE)
+      LOGGER.warn "Response flow credit timeout: request_id=#{request_id}, timeout=#{@flow_credit_wait_timeout}, backend=#{@nats_backend}"
+    end
+    result
+  end
+
+  def grant_initial_response_credit(context)
+    return if context.receiver_service_id.to_s.empty?
+
+    @core.send_response_credit(context.request_id, context.receiver_service_id, @flow_initial_window_bytes)
+  end
+
+  def return_response_credit(context, bytes)
+    return if context.receiver_service_id.to_s.empty?
+
+    pending = context.pending_response_credit_bytes.to_i + bytes.to_i
+    if pending >= flow_credit_threshold
+      @core.send_response_credit(context.request_id, context.receiver_service_id, pending)
+      context.pending_response_credit_bytes = 0
+    else
+      context.pending_response_credit_bytes = pending
+    end
+  end
+
+  def flush_response_credit(context)
+    pending = context.pending_response_credit_bytes.to_i
+    context.pending_response_credit_bytes = 0
+    @core.send_response_credit(context.request_id, context.receiver_service_id, pending) if pending.positive? && !context.receiver_service_id.to_s.empty?
+  end
+
+  def flow_credit_threshold
+    [@flow_credit_batch_bytes, @flow_initial_window_bytes].select(&:positive?).min || 1
+  end
+
+  def record_flow_credit_wait(request_id, direction)
+    collector = @core.collector if @core.respond_to?(:collector)
+    collector&.record_flow_credit_wait(request_id:, direction:) if collector&.respond_to?(:record_flow_credit_wait)
+  end
+
+  def record_flow_credit_timeout(request_id, direction)
+    collector = @core.collector if @core.respond_to?(:collector)
+    collector&.record_flow_credit_timeout(request_id:, direction:) if collector&.respond_to?(:record_flow_credit_timeout)
+  end
 end

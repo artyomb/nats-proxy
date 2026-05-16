@@ -9,11 +9,11 @@ The architecture section is split by runtime boundary:
 
 | Page | What it covers |
 |---|---|
-| [Bridge Protocol](bridge-protocol/) | JSON request envelopes, response events, stream framing, and cancellation envelopes. |
+| [Bridge Protocol](bridge-protocol/) | JSON request envelopes, response events, stream framing, flow credit, and cancellation envelopes. |
 | [NATS Transport](nats-transport/) | Core NATS vs JetStream behavior, subjects, listeners, and consumers. |
 | [TCP Sessions](tcp-sessions/) | HTTP `CONNECT` and SOCKS5 tunnel sessions over NATS frame subjects. |
 
-Stream and tunnel cancellation behavior is documented with [Bridge Protocol](bridge-protocol/), alongside the request and response events it uses.
+Stream and tunnel flow control and cancellation behavior is documented with [Bridge Protocol](bridge-protocol/), alongside the request and response events it uses.
 
 ## Runtime Composition
 
@@ -54,7 +54,7 @@ flowchart TB
 
   subgraph receiver["receiver role"]
     direction TB
-    rec_listen["request + upstream session + cancel listeners"]
+    rec_listen["request + upstream session + cancel + control listeners"]
     rec_out["outbound HTTP / TCP"]
   end
 
@@ -68,7 +68,7 @@ The requester also listens for responses and downstream TCP frames that return t
 
 In the requester role, `BridgeCore` starts the response listener and downstream session listener. If `SOCKS5_ENABLED=true`, `ServiceRuntime` also starts `Socks5Server`.
 
-In the receiver role, `BridgeCore` starts the request listener, upstream session listener, and owner-scoped cancel listener. HTTP requests are handled by `HttpGateway`; TCP sessions are handled by `TcpTunnelBridge`.
+In the receiver role, `BridgeCore` starts the request listener, upstream session listener, owner-scoped cancel listener, and owner-scoped control listener for HTTP response credit. HTTP requests are handled by `HttpGateway`; TCP sessions are handled by `TcpTunnelBridge`.
 
 When more than one requester or receiver instance is running, `BridgeCore` uses `SERVICE_ID` to keep flow continuation scoped to the original requester and the selected receiver.
 
@@ -77,10 +77,11 @@ When more than one requester or receiver instance is running, `BridgeCore` uses 
 | Component | Responsibility |
 |---|---|
 | `NatsAsyncRuntime` | Starts the `nats-async` client, resolves `NATS_MODE` to `core` or `jetstream`, publishes messages, subscribes to subjects, and exposes connection snapshots. |
-| `BridgeCore` | Owns subject naming, pending request contexts, receiver dispatch queue, response listeners, session frame routing, cancellation envelopes, and JetStream pull consumer handling. |
+| `BridgeCore` | Owns subject naming, pending request contexts, receiver dispatch queue, response listeners, session frame routing, flow-credit frames, cancellation envelopes, and JetStream pull consumer handling. |
 | `HttpGateway` | Converts Rack requests into `http_request` payloads, forwards receiver-side HTTP requests to `UPSTREAM_URL` or absolute proxy targets, and renders bridge events back into Rack responses. |
-| `TcpTunnelBridge` | Opens `tcp_stream` sessions for HTTP `CONNECT` and SOCKS5, pumps binary frames in both directions, and closes sessions on timeout, disconnect, or target close. |
-| `RequestContext` | Tracks per-request queues, streaming state, cancellation state, receiver service id, and final outcome. |
+| `TcpTunnelBridge` | Opens `tcp_stream` sessions for HTTP `CONNECT` and SOCKS5, pumps binary frames in both directions, returns flow credit after socket writes, and closes sessions on flow timeout, disconnect, or target close. |
+| `FlowCreditWindow` | Bounds bytes that may be published for streaming HTTP responses and TCP session directions until the consuming side returns credit. |
+| `RequestContext` | Tracks per-request queues, streaming state, cancellation state, receiver service id, flow-credit windows, and final outcome. |
 | `ObservabilityCollector` | Records bridge events and reconstructs flows, cases, metrics, and NATS runtime payloads for `/observability/*`. |
 
 ## Request Handling Shape

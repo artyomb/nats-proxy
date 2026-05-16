@@ -5,6 +5,7 @@ require 'socket'
 require 'securerandom'
 require 'uri'
 require_relative 'bridge_protocol'
+require_relative 'flow_credit_window'
 
 class TcpTunnelBridge
   DEFAULT_CHUNK_SIZE = 32_768
@@ -15,7 +16,10 @@ class TcpTunnelBridge
     nats_backend:,
     service_id:,
     nats_response_timeout:,
-    stream_response_timeout:
+    stream_response_timeout:,
+    flow_initial_window_bytes: FlowCreditWindow.default_initial_bytes(chunk_size: DEFAULT_CHUNK_SIZE),
+    flow_credit_batch_bytes: FlowCreditWindow.default_batch_bytes(chunk_size: DEFAULT_CHUNK_SIZE),
+    flow_credit_wait_timeout: nil
   )
     @core = core
     @nats_client = nats_client
@@ -23,6 +27,9 @@ class TcpTunnelBridge
     @service_id = service_id
     @nats_response_timeout = nats_response_timeout
     @stream_response_timeout = stream_response_timeout
+    @flow_initial_window_bytes = flow_initial_window_bytes.to_i
+    @flow_credit_batch_bytes = flow_credit_batch_bytes.to_i
+    @flow_credit_wait_timeout = (flow_credit_wait_timeout || stream_response_timeout).to_f
     max_payload = nats_client.respond_to?(:max_payload) ? nats_client.max_payload.to_i : 1_048_576
     max_payload = 1_048_576 if max_payload <= 0
     @chunk_size = [max_payload / 2, DEFAULT_CHUNK_SIZE].min
@@ -61,6 +68,7 @@ class TcpTunnelBridge
     end
 
     context.receiver_service_id = established['receiver_service_id']
+    grant_initial_downstream_credit(context, session_id)
     hijack = env['rack.hijack']
     unless hijack.respond_to?(:call)
       @core.close_session(session_id, reason: 'hijack_not_supported', receiver_service_id: context.receiver_service_id)
@@ -93,6 +101,7 @@ class TcpTunnelBridge
     emit_failure_response:,
     request_id:,
     upstream_queue:,
+    downstream_credit_window: nil,
     detached: false,
     task_parent: nil,
     on_complete: nil,
@@ -148,12 +157,13 @@ class TcpTunnelBridge
         ingress_kind: payload['ingress_kind']
       )
     )
+    grant_initial_upstream_credit(request_id, requester_service_id)
     LOGGER.info "Session established: session_id=#{request_id}, target=#{host}:#{port}, backend=#{@nats_backend}"
 
     if detached
       socket_detached = true
       task_parent.async(annotation: "tcp-session-#{request_id}") do |session_task|
-        outcome = pump_receiver_tunnel(session_task, socket, upstream_queue, cancel_check, request_id, requester_service_id, &emit)
+        outcome = pump_receiver_tunnel(session_task, socket, upstream_queue, cancel_check, request_id, requester_service_id, downstream_credit_window, &emit)
         on_complete&.call(outcome)
       rescue Async::Stop
         raise
@@ -168,7 +178,7 @@ class TcpTunnelBridge
     end
 
     with_async_task do |task|
-      pump_receiver_tunnel(task, socket, upstream_queue, cancel_check, request_id, requester_service_id, &emit)
+      pump_receiver_tunnel(task, socket, upstream_queue, cancel_check, request_id, requester_service_id, downstream_credit_window, &emit)
     end
   ensure
     socket&.close unless socket_detached rescue nil
@@ -185,16 +195,36 @@ class TcpTunnelBridge
     end
   end
 
-  def pump_receiver_tunnel(task, socket, upstream_queue, cancel_check, session_id, requester_service_id)
+  def pump_receiver_tunnel(task, socket, upstream_queue, cancel_check, session_id, requester_service_id, downstream_credit_window)
     stop = false
+    close_reason = 'target_closed'
 
     reader = task.async do
       loop do
         break if stop || cancel_check.call
 
-        chunk = read_chunk(socket)
-        break unless chunk
-        next if chunk.empty?
+        allowed = reserve_flow_bytes(
+          downstream_credit_window,
+          cancel_check:,
+          request_id: session_id,
+          direction: BridgeProtocol::DIRECTION_DOWNSTREAM
+        )
+        if allowed == FlowCreditWindow::TIMEOUT
+          close_reason = 'flow_credit_timeout'
+          break
+        end
+        break unless allowed
+
+        chunk = read_chunk(socket, allowed)
+        unless chunk
+          return_unused_flow_bytes(downstream_credit_window, allowed, 0)
+          break
+        end
+        if chunk.empty?
+          return_unused_flow_bytes(downstream_credit_window, allowed, 0)
+          next
+        end
+        return_unused_flow_bytes(downstream_credit_window, allowed, chunk.bytesize)
 
         @core.send_session_downstream(session_id, requester_service_id, chunk)
       end
@@ -206,6 +236,7 @@ class TcpTunnelBridge
     end
 
     writer = task.async do
+      credit = 0
       loop do
         break if stop || cancel_check.call
 
@@ -213,8 +244,15 @@ class TcpTunnelBridge
         next if data.nil?
         break if data == :session_close
 
-        write_all(socket, data)
+        written = write_all(socket, data)
+        record_socket_write(session_id, BridgeProtocol::DIRECTION_UPSTREAM, written)
+        credit += written
+        if credit >= flow_credit_threshold
+          @core.send_session_credit_upstream(session_id, requester_service_id, credit)
+          credit = 0
+        end
       end
+      @core.send_session_credit_upstream(session_id, requester_service_id, credit) if credit.positive?
     rescue IOError, Errno::ECONNRESET, Errno::EPIPE => e
       LOGGER.info "Session target write failed: session_id=#{session_id}, error=#{e.class}"
     ensure
@@ -225,8 +263,10 @@ class TcpTunnelBridge
     reader.wait
     writer.wait
 
-    reason = cancel_check.call ? 'cancel_requested' : 'target_closed'
+    reason = cancel_check.call ? 'cancel_requested' : close_reason
     yield BridgeProtocol.session_close_event(reason:)
+    return BridgeProtocol::OUTCOME_TIMEOUT if close_reason == 'flow_credit_timeout'
+
     cancel_check.call ? BridgeProtocol::OUTCOME_CANCELED : BridgeProtocol::OUTCOME_COMPLETED
   rescue => e
     LOGGER.error "Session tunnel error: session_id=#{session_id}, error=#{e.class} - #{e.message}"
@@ -241,32 +281,90 @@ class TcpTunnelBridge
     nil
   end
 
+  def grant_initial_downstream_credit(context, session_id)
+    @core.send_session_credit_downstream(session_id, context.receiver_service_id, @flow_initial_window_bytes)
+  end
+
+  def grant_initial_upstream_credit(session_id, requester_service_id)
+    @core.send_session_credit_upstream(session_id, requester_service_id, @flow_initial_window_bytes)
+  end
+
+  def reserve_flow_bytes(window, cancel_check:, request_id:, direction:)
+    unless window
+      LOGGER.warn "Missing flow credit window: request_id=#{request_id}, direction=#{direction}, backend=#{@nats_backend}"
+      return nil
+    end
+
+    result = window.reserve(
+      @chunk_size,
+      timeout: @flow_credit_wait_timeout,
+      cancel_check:,
+      on_wait: -> { record_flow_credit_wait(request_id, direction) }
+    )
+    if result == FlowCreditWindow::TIMEOUT
+      record_flow_credit_timeout(request_id, direction)
+      LOGGER.warn "Flow credit timeout: request_id=#{request_id}, direction=#{direction}, timeout=#{@flow_credit_wait_timeout}, backend=#{@nats_backend}"
+    end
+    result
+  end
+
+  def flow_credit_threshold
+    [@flow_credit_batch_bytes, @flow_initial_window_bytes].select(&:positive?).min || 1
+  end
+
+  def return_unused_flow_bytes(window, reserved, used)
+    return unless window
+
+    unused = reserved.to_i - used.to_i
+    window.grant(unused) if unused.positive?
+  end
+
   def pump_requester_tunnel(task, client_io, context, session_id)
     stop = false
+    close_reason = 'client_closed'
+    done = Async::Notification.new
 
     reader = task.async do
       loop do
         break if stop
 
-        bytes = read_chunk(client_io)
-        break unless bytes
-        next if bytes.empty?
+        allowed = reserve_flow_bytes(
+          context.upstream_credit_window,
+          cancel_check: -> { stop || context.cancel_requested? },
+          request_id: session_id,
+          direction: BridgeProtocol::DIRECTION_UPSTREAM
+        )
+        if allowed == FlowCreditWindow::TIMEOUT
+          close_reason = 'flow_credit_timeout'
+          break
+        end
+        break unless allowed
+
+        bytes = read_chunk(client_io, allowed)
+        unless bytes
+          return_unused_flow_bytes(context.upstream_credit_window, allowed, 0)
+          break
+        end
+        if bytes.empty?
+          return_unused_flow_bytes(context.upstream_credit_window, allowed, 0)
+          next
+        end
+        return_unused_flow_bytes(context.upstream_credit_window, allowed, bytes.bytesize)
 
         @core.send_session_data(session_id, bytes, receiver_service_id: context.receiver_service_id)
       end
-      @core.close_session(session_id, reason: 'client_closed', receiver_service_id: context.receiver_service_id)
+      @core.close_session(session_id, reason: close_reason, receiver_service_id: context.receiver_service_id)
     rescue IOError, Errno::ECONNRESET, Errno::EPIPE
       @core.close_session(session_id, reason: 'client_disconnected', receiver_service_id: context.receiver_service_id)
     ensure
       stop = true
+      done.signal
     end
 
     writer = task.async do
-      outcome = tunnel_writer_loop(client_io, context)
+      outcome = tunnel_writer_loop(client_io, context, cancel_check: -> { stop || context.cancel_requested? })
 
       case outcome
-      when :timeout
-        @core.cancel_request(context, reason: 'stream_timeout')
       when Hash
         @core.cancel_request(context, reason: 'upstream_error')
       end
@@ -274,10 +372,12 @@ class TcpTunnelBridge
       @core.cancel_request(context, reason: 'downstream_disconnect')
     ensure
       stop = true
+      done.signal
     end
 
-    writer.wait
+    done.wait
     reader.stop
+    writer.stop
   rescue => e
     LOGGER.error "Requester tunnel error: session_id=#{session_id}, error=#{e.class} - #{e.message}"
   ensure
@@ -286,33 +386,42 @@ class TcpTunnelBridge
     LOGGER.info "Requester tunnel closed: session_id=#{session_id}"
   end
 
-  def tunnel_writer_loop(client_io, context)
-    idle_deadline = Time.now + @stream_response_timeout
+  def tunnel_writer_loop(client_io, context, cancel_check: -> { false })
+    credit = 0
 
     loop do
+      return :finished if cancel_check.call
+
       chunk = context.tunnel_data_queue&.dequeue(timeout: 0.1)
       if chunk
-        write_all(client_io, chunk)
-        idle_deadline = Time.now + @stream_response_timeout
+        written = write_all(client_io, chunk)
+        record_socket_write(context.request_id, BridgeProtocol::DIRECTION_DOWNSTREAM, written)
+        credit += written
+        if credit >= flow_credit_threshold
+          @core.send_session_credit_downstream(context.request_id, context.receiver_service_id, credit)
+          credit = 0
+        end
         next
       end
 
       control = context.response_queue.dequeue(timeout: 0)
       if control
-        idle_deadline = Time.now + @stream_response_timeout
-
         case control['type']
         when BridgeProtocol::SESSION_CLOSE
+          @core.send_session_credit_downstream(context.request_id, context.receiver_service_id, credit) if credit.positive?
+          credit = 0
           return :finished
         when BridgeProtocol::RESPONSE_ERROR
+          @core.send_session_credit_downstream(context.request_id, context.receiver_service_id, credit) if credit.positive?
+          credit = 0
           return control
         else
           raise BridgeProtocol::ProtocolError, "Unexpected tunnel control event #{control['type']}"
         end
       end
-
-      return :timeout if Time.now >= idle_deadline
     end
+  ensure
+    @core.send_session_credit_downstream(context.request_id, context.receiver_service_id, credit) if defined?(credit) && credit.to_i.positive?
   end
 
   def local_bind_address(socket)
@@ -343,13 +452,40 @@ class TcpTunnelBridge
     [nil, 0]
   end
 
-  def read_chunk(io)
-    io.readpartial(@chunk_size)
+  def read_chunk(io, max_bytes = @chunk_size)
+    io.readpartial([max_bytes.to_i, @chunk_size].min)
   rescue EOFError
     nil
   end
 
   def write_all(io, data)
-    io.write(data.to_s.b)
+    buffer = data.to_s.b
+    offset = 0
+
+    while offset < buffer.bytesize
+      written = io.write(buffer.byteslice(offset, buffer.bytesize - offset))
+      raise IOError, 'socket write returned no progress' unless written.to_i.positive?
+
+      offset += written.to_i
+    end
+
+    offset
+  end
+
+  def record_socket_write(request_id, direction, bytes)
+    collector = @core.collector if @core.respond_to?(:collector)
+    return unless collector&.respond_to?(:record_tunnel_socket_write)
+
+    collector.record_tunnel_socket_write(request_id:, direction:, bytes:)
+  end
+
+  def record_flow_credit_wait(request_id, direction)
+    collector = @core.collector if @core.respond_to?(:collector)
+    collector&.record_flow_credit_wait(request_id:, direction:) if collector&.respond_to?(:record_flow_credit_wait)
+  end
+
+  def record_flow_credit_timeout(request_id, direction)
+    collector = @core.collector if @core.respond_to?(:collector)
+    collector&.record_flow_credit_timeout(request_id:, direction:) if collector&.respond_to?(:record_flow_credit_timeout)
   end
 end

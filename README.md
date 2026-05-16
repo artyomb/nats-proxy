@@ -111,6 +111,7 @@ Clients can use the `nats-proxy` endpoint in these ways:
 - Core NATS and JetStream backends.
 - Multi-instance requester/receiver topologies with receiver-balanced flow starts.
 - Binary-safe chunk transport using base64 when a response chunk is not valid UTF-8.
+- Flow control for streaming HTTP responses and TCP tunnels, so large transfers are paced by the side that consumes them.
 - Best-effort stream cancellation when the downstream client disconnects.
 - Local observability UI and JSON APIs for flows, cases, metrics, and NATS runtime state.
 - Optional proxy authentication with bcrypt-hashed users for HTTP proxy, `CONNECT`, and SOCKS5 traffic.
@@ -197,7 +198,7 @@ The service exposes local observability endpoints:
 | `GET /observability` | HTML UI for runtime health, NATS state, flow cases, and raw payload inspection. |
 | `GET /observability/flows` | Event feed. Supports filters such as `request_id`, `subject`, `event_type`, `outcome`, `from`, `to`, `limit`, and `include_nats_payload`. |
 | `GET /observability/cases` | Request/session case summaries reconstructed from recorded events. |
-| `GET /observability/metrics` | RPS, error/cancel rates, and reconstruction quality for a bounded window. |
+| `GET /observability/metrics` | RPS, error/cancel rates, flow-control counters, and reconstruction quality for a bounded window. |
 | `GET /observability/nats` | NATS connection snapshot and JetStream stream/consumer details when available. |
 | `GET /healthcheck` | Health endpoint provided by the Rack service base. |
 

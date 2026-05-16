@@ -1,16 +1,16 @@
 ---
 title: Bridge Protocol
-description: Request envelopes, response events, stream framing, and cancellation.
+description: Request envelopes, response events, stream framing, flow credit, and cancellation.
 ---
 
-The bridge protocol is the message format used between the requester and receiver after a client request enters the bridge. Read this page when you need to understand what is sent through NATS, how responses come back, and how streams or tunnels are stopped.
+The bridge protocol is the message format used between the requester and receiver after a client request enters the bridge. Read this page when you need to understand what is sent through NATS, how responses come back, how large streams are paced, and how streams or tunnels are stopped.
 
 HTTP work is JSON-framed. TCP tunnel data uses binary NATS frames after an initial JSON session open request.
 
 For code-level debugging, the main implementation is split between `BridgeProtocol` and `BridgeCore`:
 
 - `BridgeProtocol` builds and parses protocol objects.
-- `BridgeCore` chooses subjects, publishes requests, validates envelopes, dispatches operation handlers, routes response events, and publishes cancellation envelopes.
+- `BridgeCore` chooses subjects, publishes requests, validates envelopes, dispatches operation handlers, routes response events, handles flow-credit frames, and publishes cancellation envelopes.
 
 ## Operations
 
@@ -111,22 +111,55 @@ sequenceDiagram
   Rec->>Up: forwarded HTTP request
   Up-->>Rec: SSE or NDJSON stream
   Rec-->>NATS: response_start(streaming=true)
+  Req-->>NATS: response_credit
   loop each upstream chunk
     Rec-->>NATS: response_chunk
     NATS-->>Req: response_chunk
     Req-->>Client: stream chunk
+    Req-->>NATS: response_credit after client write
   end
   Rec-->>NATS: response_end
   Req-->>Client: close response body
 ```
 
-For streaming responses, `HttpGateway` writes each chunk to the Rack stream as it arrives. Each wait for the next event uses `STREAM_RESPONSE_TIMEOUT`.
+For streaming responses, the requester grants initial response credit after it receives `response_start` and learns the owner receiver. The receiver reserves credit before publishing `response_chunk` events. The requester returns credit only after writing bytes to the downstream Rack stream. Each wait for the next response event uses `STREAM_RESPONSE_TIMEOUT`.
 
 If the upstream fails after a stream has started, the receiver emits `response_error` followed by `response_end`. The requester writes an in-band error formatted for the stream content type:
 
 - SSE: `event: error` with JSON data.
 - NDJSON: one JSON error object followed by a newline.
 - Other content types: a JSON error body.
+
+## Flow Control
+
+Flow control keeps streaming HTTP responses and TCP tunnels bounded by the side that consumes bytes. Without it, a fast receiver can publish more data into NATS than the requester can write to the client socket, and a fast client can do the same in the upstream tunnel direction.
+
+Credit frames are normal bridge protocol messages with `type=flow_credit`:
+
+```json
+{
+  "type": "flow_credit",
+  "request_id": "req-or-session-id",
+  "direction": "response",
+  "bytes": 262144,
+  "service_id": "requester-1",
+  "timestamp": "2026-04-24T00:00:00Z"
+}
+```
+
+Valid directions are:
+
+| Direction | Protects | Credit sender | Credit receiver |
+|---|---|---|---|
+| `response` | HTTP streaming response chunks from receiver to requester | requester, after writing response bytes to the client | owner receiver control listener |
+| `upstream` | TCP tunnel bytes from requester to receiver target socket | receiver, after writing bytes to the target socket | requester downstream session listener |
+| `downstream` | TCP tunnel bytes from receiver target socket to requester | requester, after writing bytes to the client socket | owner receiver upstream session listener |
+
+Credit frames use `Nats-Session-Id` and `Nats-Frame-Type` headers to share the same routing code as session frames. HTTP response credit uses `Nats-Frame-Type=response_credit` and the owner-scoped control subject `<request_root>.control.<receiver_service_id>.<request_id>`. TCP tunnel credit uses session subjects with `session_credit_upstream` or `session_credit_downstream`.
+
+Window sizes are derived from the effective NATS max payload and the service chunk size. With the default 32 KiB chunk size, the initial window is 1 MiB, credit is usually returned in 256 KiB batches, and the retained window is capped at 4 MiB. These values are implementation sizing, not environment variables.
+
+If a publisher cannot reserve credit before `STREAM_RESPONSE_TIMEOUT`, the flow records a flow-credit timeout. HTTP streaming responses emit an in-band error when the stream already started. TCP tunnels close the session with reason `flow_credit_timeout`.
 
 ## Cancellation
 

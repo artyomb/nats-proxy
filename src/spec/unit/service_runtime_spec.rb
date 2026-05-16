@@ -30,7 +30,7 @@ RSpec.describe ServiceRuntime do
     }
   end
   let(:proxy_auth) { instance_double("ProxyAuth") }
-  let(:nats_service) { instance_double("NatsAsyncRuntime", start: true, backend: :core, close: true) }
+  let(:nats_service) { instance_double("NatsAsyncRuntime", start: true, backend: :core, close: true, max_payload: 1_048_576) }
   let(:core) do
     instance_double(
       "BridgeCore",
@@ -40,6 +40,7 @@ RSpec.describe ServiceRuntime do
       start_request_listener: nil,
       start_upstream_session_listener: nil,
       start_cancel_listener: nil,
+      start_control_listener: nil,
       bridge_inbound?: false,
       bridge_outbound?: true,
       close: true
@@ -78,5 +79,18 @@ RSpec.describe ServiceRuntime do
     runtime.instance_variable_set(:@backend, :jetstream)
 
     expect(runtime.observability_consumer).to eq("nats-proxy-responses-srv-test")
+  end
+
+  it "derives flow window settings from the NATS max payload" do
+    runtime = described_class.new(config: config, proxy_auth: proxy_auth)
+    runtime.instance_variable_set(:@nats_service, nats_service)
+
+    expect(runtime.send(:flow_window_config)).to include(
+      flow_chunk_size: 32_768,
+      flow_initial_window_bytes: FlowCreditWindow.default_initial_bytes(chunk_size: 32_768),
+      flow_credit_batch_bytes: FlowCreditWindow.default_batch_bytes(chunk_size: 32_768),
+      flow_max_window_bytes: FlowCreditWindow.default_max_bytes(chunk_size: 32_768),
+      flow_credit_wait_timeout: 5.0
+    )
   end
 end

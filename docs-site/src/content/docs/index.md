@@ -95,6 +95,7 @@ For technical details and examples for each pattern, see [Traffic Patterns](conc
 - Core NATS and JetStream backends.
 - Multi-instance requester/receiver topologies with receiver-balanced flow starts.
 - Binary-safe chunk transport using base64 when a response chunk is not valid UTF-8.
+- Flow control for streaming HTTP responses and TCP tunnels, so large transfers are paced by the side that consumes them.
 - Best-effort stream cancellation when the downstream client disconnects.
 - Local observability UI and JSON APIs for flows, cases, metrics, and NATS runtime state.
 - Optional proxy authentication with bcrypt-hashed users for HTTP proxy, `CONNECT`, and SOCKS5 traffic.

@@ -69,8 +69,30 @@ class ObservabilityCollector
     append_event(event_type, request_id:, subject:, meta: normalized, nats_payload: encode_nats_wire(wire_source))
   end
 
-  def record_session_chunk(request_id:, subject:, direction:)
-    append_event('session_chunk', request_id:, subject:, meta: { direction: direction.to_s }, nats_payload: nil)
+  def record_session_chunk(request_id:, subject:, direction:, bytes: nil)
+    meta = { direction: direction.to_s }
+    meta[:bytes] = bytes.to_i if bytes
+    append_event('session_chunk', request_id:, subject:, meta:, nats_payload: nil)
+  end
+
+  def record_tunnel_socket_write(request_id:, direction:, bytes:)
+    append_event('tunnel_socket_write', request_id:, subject: nil, meta: { direction: direction.to_s, bytes: bytes.to_i }, nats_payload: nil)
+  end
+
+  def record_flow_credit_sent(request_id:, subject:, direction:, bytes:)
+    append_event('flow_credit_sent', request_id:, subject:, meta: { direction: direction.to_s, bytes: bytes.to_i }, nats_payload: nil)
+  end
+
+  def record_flow_credit_received(request_id:, subject:, direction:, bytes:)
+    append_event('flow_credit_received', request_id:, subject:, meta: { direction: direction.to_s, bytes: bytes.to_i }, nats_payload: nil)
+  end
+
+  def record_flow_credit_wait(request_id:, direction:)
+    append_event('flow_credit_wait', request_id:, subject: nil, meta: { direction: direction.to_s }, nats_payload: nil)
+  end
+
+  def record_flow_credit_timeout(request_id:, direction:)
+    append_event('flow_credit_timeout', request_id:, subject: nil, meta: { direction: direction.to_s }, nats_payload: nil)
   end
 
   def flow_events(filters = {})
@@ -101,6 +123,7 @@ class ObservabilityCollector
       request_published = request_events.find { |event| event[:type] == 'request_published' }
       response_start = request_events.find { |event| event[:type] == 'response_start' }
       chunk_count = request_events.count { |event| %w[response_chunk session_chunk].include?(event[:type]) }
+      credit_events = request_events.select { |event| %w[flow_credit_sent flow_credit_received].include?(event[:type]) }
       derived_status, derived_outcome = case_status_and_outcome(request_events)
 
       {
@@ -116,6 +139,10 @@ class ObservabilityCollector
         duration_ms: duration_ms(first&.dig(:at), terminal&.dig(:at)),
         events_total: request_events.size,
         chunks_total: chunk_count,
+        credits_total: credit_events.size,
+        credit_bytes_total: credit_events.sum { |event| event.dig(:meta, :bytes).to_i },
+        flow_waits_total: request_events.count { |event| event[:type] == 'flow_credit_wait' },
+        flow_timeouts_total: request_events.count { |event| event[:type] == 'flow_credit_timeout' },
         subject: request_published&.dig(:subject) || response_start&.dig(:subject) || first&.dig(:subject),
         method: request_published&.dig(:meta, :method),
         path: request_published&.dig(:meta, :path),
@@ -148,6 +175,10 @@ class ObservabilityCollector
           duration_ms: item[:duration_ms],
           events_total: item[:events_total],
           chunks_total: item[:chunks_total],
+          credits_total: item[:credits_total],
+          credit_bytes_total: item[:credit_bytes_total],
+          flow_waits_total: item[:flow_waits_total],
+          flow_timeouts_total: item[:flow_timeouts_total],
           subject: item[:subject],
           method: item[:method],
           path: item[:path],
@@ -164,6 +195,9 @@ class ObservabilityCollector
     response_end_count = recent.count { |event| %w[response_end session_close].include?(event[:type]) }
     response_error_count = recent.count { |event| event[:type] == 'response_error' }
     cancel_count = recent.count { |event| %w[cancel_published cancel_observed].include?(event[:type]) }
+    credit_count = recent.count { |event| %w[flow_credit_sent flow_credit_received].include?(event[:type]) }
+    flow_wait_count = recent.count { |event| event[:type] == 'flow_credit_wait' }
+    flow_timeout_count = recent.count { |event| event[:type] == 'flow_credit_timeout' }
 
     {
       schema_version: '1.0.0',
@@ -173,7 +207,16 @@ class ObservabilityCollector
         requests_rps: ratio(request_count, window_sec),
         responses_rps: ratio(response_end_count, window_sec),
         errors_rps: ratio(response_error_count, window_sec),
-        cancels_rps: ratio(cancel_count, window_sec)
+        cancels_rps: ratio(cancel_count, window_sec),
+        credits_rps: ratio(credit_count, window_sec),
+        flow_waits_rps: ratio(flow_wait_count, window_sec),
+        flow_timeouts_rps: ratio(flow_timeout_count, window_sec)
+      },
+      flow_control: {
+        credits_total: credit_count,
+        credit_bytes_total: recent.sum { |event| %w[flow_credit_sent flow_credit_received].include?(event[:type]) ? event.dig(:meta, :bytes).to_i : 0 },
+        flow_waits_total: flow_wait_count,
+        flow_timeouts_total: flow_timeout_count
       },
       reconstruction_quality: {
         success_ratio: request_count.zero? ? 1.0 : (response_end_count.to_f / request_count).round(4),

@@ -12,7 +12,7 @@ The collector keeps events for the most recent request ids only. A quiet process
 | `GET /observability` | HTML UI. |
 | `GET /observability/flows` | Raw event feed. |
 | `GET /observability/cases` | Request/session summaries reconstructed from events. |
-| `GET /observability/metrics` | Request, response, error, and cancel rates for a bounded window. |
+| `GET /observability/metrics` | Request, response, error, cancel, and flow-control rates for a bounded window. |
 | `GET /observability/nats` | NATS connection snapshot and JetStream stream/consumer details when available. |
 
 ## Flows
@@ -24,7 +24,7 @@ curl -sS 'http://127.0.0.1:7000/observability/flows?request_id=<request_id>&incl
 
 Supported filters: `request_id`, `subject`, `service_id`, `event_type`, `outcome`, `from`, `to`, `limit`, and `include_nats_payload`.
 
-Read it as a chronological feed of `request_published`, `response_start`, `response_chunk`, `response_error`, `response_end`, `session_chunk`, `session_close`, `cancel_published`, and `cancel_observed`.
+Read it as a chronological feed of `request_published`, `response_start`, `response_chunk`, `response_error`, `response_end`, `session_chunk`, `session_close`, `flow_credit_sent`, `flow_credit_received`, `flow_credit_wait`, `flow_credit_timeout`, `cancel_published`, and `cancel_observed`.
 
 ## Cases
 
@@ -35,7 +35,7 @@ curl -sS 'http://127.0.0.1:7000/observability/cases?outcome=timeout'
 
 Supported filters include the flow filters plus `status`. Case statuses include `queued`, `in_progress`, `completed`, `failed`, `timed_out`, and `canceled`.
 
-Use cases to answer whether a request reached the requester, got a response start, completed, timed out, or was canceled.
+Use cases to answer whether a request reached the requester, got a response start, completed, timed out, or was canceled. Case summaries also include flow-control counters: `credits_total`, `credit_bytes_total`, `flow_waits_total`, and `flow_timeouts_total`.
 
 ## Metrics
 
@@ -43,7 +43,7 @@ Use cases to answer whether a request reached the requester, got a response star
 curl -sS 'http://127.0.0.1:7000/observability/metrics?window_sec=60'
 ```
 
-`window_sec` is clamped to `1..300`. The payload includes `requests_rps`, `responses_rps`, `errors_rps`, `cancels_rps`, and reconstruction quality ratios.
+`window_sec` is clamped to `1..300`. The payload includes `requests_rps`, `responses_rps`, `errors_rps`, `cancels_rps`, `credits_rps`, `flow_waits_rps`, `flow_timeouts_rps`, a `flow_control` aggregate, and reconstruction quality ratios.
 
 ## NATS
 
