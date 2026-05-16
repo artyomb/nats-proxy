@@ -5,6 +5,7 @@ require 'async/semaphore'
 require 'concurrent-ruby'
 require_relative 'request_context'
 require_relative 'bridge_protocol'
+require_relative 'flow_credit_window'
 
 class BridgeCore
   class PullMessage
@@ -47,6 +48,11 @@ class BridgeCore
     @stream_timeout         = config.fetch(:stream_timeout)
     @max_inflight           = config.fetch(:max_inflight)
     @queue_size             = config.fetch(:queue_size)
+    default_chunk_size = 32_768
+    @flow_chunk_size = config.fetch(:flow_chunk_size, default_chunk_size).to_i
+    @flow_chunk_size = default_chunk_size if @flow_chunk_size <= 0
+    @flow_initial_window_bytes = config.fetch(:flow_initial_window_bytes, FlowCreditWindow.default_initial_bytes(chunk_size: @flow_chunk_size)).to_i
+    @flow_max_window_bytes = config.fetch(:flow_max_window_bytes, FlowCreditWindow.default_max_bytes(chunk_size: @flow_chunk_size)).to_i
 
     @pending_requests = Concurrent::Map.new
     @active_streams   = Concurrent::Map.new
@@ -63,8 +69,11 @@ class BridgeCore
     @upstream_session_listener_task = nil
     @downstream_session_listener_task = nil
     @cancel_listener_task = nil
+    @control_listener_task = nil
     @session_barrier = Concurrent::AtomicReference.new(nil)
   end
+
+  attr_reader :collector, :flow_initial_window_bytes, :flow_max_window_bytes, :flow_chunk_size
 
   def bridge_outbound? = listener_alive?(@response_listener_task)
 
@@ -86,6 +95,7 @@ class BridgeCore
 
   def bridge_request(request_id:, operation: 'http_request', payload:)
     context = RequestContext.new(request_id:)
+    attach_flow_windows(context)
     context.request_subject = subject_for_request(request_id)
     @pending_requests[request_id] = context
 
@@ -110,8 +120,9 @@ class BridgeCore
 
   def bridge_session_open(session_id:, payload:)
     context = RequestContext.new(request_id: session_id)
+    attach_flow_windows(context)
     context.request_subject = subject_for_request(session_id)
-    context.tunnel_data_queue = Async::Queue.new
+    context.tunnel_data_queue = build_session_queue
     @pending_requests[session_id] = context
 
     message = BridgeProtocol.request_envelope(
@@ -145,20 +156,50 @@ class BridgeCore
 
   def send_session_data(session_id, binary_data, receiver_service_id:)
     subject = session_upstream_subject(receiver_service_id, session_id)
-    @collector.record_session_chunk(request_id: session_id, subject:, direction: 'upstream')
+    @collector.record_session_chunk(request_id: session_id, subject:, direction: BridgeProtocol::DIRECTION_UPSTREAM, bytes: binary_data.to_s.b.bytesize)
     publish_message(binary_data, subject, headers: {
       'Nats-Session-Id' => session_id,
-      'Nats-Frame-Type' => 'session_data'
+      'Nats-Frame-Type' => BridgeProtocol::FRAME_SESSION_DATA
     })
   end
 
   def send_session_downstream(session_id, requester_service_id, binary_data)
     subject = session_downstream_subject(requester_service_id, session_id)
-    @collector.record_session_chunk(request_id: session_id, subject:, direction: 'downstream')
+    @collector.record_session_chunk(request_id: session_id, subject:, direction: BridgeProtocol::DIRECTION_DOWNSTREAM, bytes: binary_data.to_s.b.bytesize)
     publish_message(binary_data, subject, headers: {
       'Nats-Session-Id' => session_id,
-      'Nats-Frame-Type' => 'session_data_downstream'
+      'Nats-Frame-Type' => BridgeProtocol::FRAME_SESSION_DATA_DOWNSTREAM
     })
+  end
+
+  def send_session_credit_downstream(session_id, receiver_service_id, bytes)
+    publish_flow_credit(
+      subject: session_upstream_subject(receiver_service_id, session_id),
+      request_id: session_id,
+      direction: BridgeProtocol::DIRECTION_DOWNSTREAM,
+      bytes:,
+      frame_type: BridgeProtocol::FRAME_SESSION_CREDIT_DOWNSTREAM
+    )
+  end
+
+  def send_session_credit_upstream(session_id, requester_service_id, bytes)
+    publish_flow_credit(
+      subject: session_downstream_subject(requester_service_id, session_id),
+      request_id: session_id,
+      direction: BridgeProtocol::DIRECTION_UPSTREAM,
+      bytes:,
+      frame_type: BridgeProtocol::FRAME_SESSION_CREDIT_UPSTREAM
+    )
+  end
+
+  def send_response_credit(request_id, receiver_service_id, bytes)
+    publish_flow_credit(
+      subject: control_subject(receiver_service_id, request_id),
+      request_id:,
+      direction: BridgeProtocol::DIRECTION_RESPONSE,
+      bytes:,
+      frame_type: BridgeProtocol::FRAME_RESPONSE_CREDIT
+    )
   end
 
   def close_session(session_id, reason: 'normal', receiver_service_id:)
@@ -167,7 +208,7 @@ class BridgeCore
       session_upstream_subject(receiver_service_id, session_id),
       headers: {
         'Nats-Session-Id' => session_id,
-        'Nats-Frame-Type' => 'session_close'
+        'Nats-Frame-Type' => BridgeProtocol::FRAME_SESSION_CLOSE
       }
     )
   end
@@ -365,8 +406,37 @@ class BridgeCore
     end
   end
 
+  def start_control_listener(task:)
+    subject = control_listen_subject
+
+    @control_listener_task = task.async(annotation: "bridge-control-listener-#{@service_id}") do |listener_task|
+      with_reconnect_loop(listener_task, 'Control listener') do
+        if @nats_backend == :jetstream
+          run_pull_listener(
+            subject:,
+            stream: @nats_stream,
+            consumer_name: "#{@consumer_name}-control-#{@service_id}",
+            params: { config: { inactive_threshold: @stream_timeout + 60 } },
+            manual_ack: false,
+            stale_ack: true
+          ) { |msg| process_control_message(msg) }
+        else
+          begin
+            sid = subscribe_core(subject) { |msg| process_control_message(msg) }
+            LOGGER.info "Control listener active: backend=#{@nats_backend}, subject=#{subject}"
+            wait_until_canceled(listener_task)
+          ensure
+            unsubscribe_core(sid)
+          end
+        end
+      end
+    end
+  end
+
   def release_pending(request_id)
-    @pending_requests.delete(request_id)
+    context = @pending_requests.delete(request_id)
+    context&.close_flow_windows(reason: 'released')
+    context
   end
 
   def close
@@ -377,6 +447,7 @@ class BridgeCore
     @upstream_session_listener_task&.stop
     @downstream_session_listener_task&.stop
     @cancel_listener_task&.stop
+    @control_listener_task&.stop
     set_bridge_state(ready: false)
   end
 
@@ -411,12 +482,23 @@ class BridgeCore
     "#{@response_subject_root}.sessions.downstream.#{target_service_id}.#{session_id}"
   end
 
+  def control_subject(receiver_service_id, request_id)
+    receiver_id = receiver_service_id.to_s
+    raise ArgumentError, "Missing receiver_service_id for request_id=#{request_id}" if receiver_id.empty?
+
+    "#{@request_subject_root}.control.#{receiver_id}.#{request_id}"
+  end
+
   def upstream_session_listen_subject
     "#{@request_subject_root}.sessions.upstream.#{@service_id}.>"
   end
 
   def downstream_session_listen_subject
     "#{@response_subject_root}.sessions.downstream.#{@service_id}.>"
+  end
+
+  def control_listen_subject
+    "#{@request_subject_root}.control.#{@service_id}.>"
   end
 
   def subject_for_cancel(receiver_service_id, request_id)
@@ -433,6 +515,50 @@ class BridgeCore
 
   def publish_message(message, subject, headers: nil)
     @nats_client.publish(message, subject, nil, raw: publish_raw?, headers:)
+  end
+
+  def publish_flow_credit(subject:, request_id:, direction:, bytes:, frame_type:)
+    amount = bytes.to_i
+    if amount <= 0
+      LOGGER.warn "Ignoring invalid flow credit publish: request_id=#{request_id}, direction=#{direction}, bytes=#{bytes}, backend=#{@nats_backend}"
+      return false
+    end
+
+    payload = BridgeProtocol.flow_credit_payload(
+      request_id: request_id.to_s,
+      service_id: @service_id,
+      direction: direction.to_s,
+      bytes: amount
+    )
+    publish_message(
+      payload.to_json,
+      subject,
+      headers: {
+        'Nats-Session-Id' => request_id.to_s,
+        'Nats-Frame-Type' => frame_type
+      }
+    )
+    @collector.record_flow_credit_sent(request_id: request_id.to_s, subject:, direction:, bytes: amount) if @collector.respond_to?(:record_flow_credit_sent)
+    true
+  end
+
+  def attach_flow_windows(context)
+    context.downstream_credit_window = build_credit_window
+    context.upstream_credit_window = build_credit_window
+    context.response_credit_window = build_credit_window
+    context
+  end
+
+  def build_credit_window(initial_bytes: 0)
+    FlowCreditWindow.new(initial_bytes:, max_bytes: @flow_max_window_bytes)
+  end
+
+  def build_session_queue
+    Async::LimitedQueue.new(flow_queue_size)
+  end
+
+  def flow_queue_size
+    (@flow_max_window_bytes.to_f / @flow_chunk_size).ceil + 4
   end
 
   def trace_headers(headers)
@@ -551,6 +677,59 @@ class BridgeCore
     LOGGER.warn "Ignoring invalid cancel JSON: subject=#{msg.subject}, backend=#{@nats_backend}"
   end
 
+  def process_control_message(msg)
+    frame_type = msg.header&.dig('Nats-Frame-Type')
+    unless frame_type == BridgeProtocol::FRAME_RESPONSE_CREDIT
+      LOGGER.warn "Dropping control frame with unknown type: frame_type=#{frame_type || 'unknown'}, subject=#{msg.subject}, backend=#{@nats_backend}"
+      return
+    end
+
+    request_id = msg.subject.to_s.split('.').last
+    context = @active_streams[request_id]
+    unless context&.response_credit_window
+      LOGGER.warn "Dropping response credit for unknown stream: request_id=#{request_id}, backend=#{@nats_backend}"
+      return
+    end
+
+    grant_flow_credit(
+      context.response_credit_window,
+      msg,
+      expected_request_id: request_id,
+      expected_direction: BridgeProtocol::DIRECTION_RESPONSE
+    )
+  end
+
+  def grant_flow_credit(window, msg, expected_request_id:, expected_direction:)
+    payload = BridgeProtocol.parse_flow_credit_payload(msg.data)
+    unless payload
+      LOGGER.warn "Ignoring invalid flow credit payload: backend=#{@nats_backend}"
+      return false
+    end
+
+    request_id = payload['request_id'].to_s
+    bytes = payload['bytes'].to_i
+    direction = payload['direction'].to_s
+
+    if request_id != expected_request_id.to_s || direction != expected_direction.to_s
+      LOGGER.warn "Dropping mismatched flow credit: expected_request_id=#{expected_request_id}, request_id=#{request_id}, expected_direction=#{expected_direction}, direction=#{direction}, backend=#{@nats_backend}"
+      return false
+    end
+
+    if bytes <= 0
+      LOGGER.warn "Ignoring invalid flow credit: request_id=#{request_id}, direction=#{direction}, bytes=#{bytes}, backend=#{@nats_backend}"
+      return false
+    end
+
+    granted = window.grant(bytes)
+    unless granted
+      LOGGER.warn "Dropping flow credit for closed stream: request_id=#{request_id}, direction=#{direction}, bytes=#{bytes}, backend=#{@nats_backend}"
+      return false
+    end
+
+    @collector.record_flow_credit_received(request_id:, subject: msg.subject, direction:, bytes:) if @collector.respond_to?(:record_flow_credit_received)
+    true
+  end
+
   def reject_invalid_request(reply_to, error:, status: 400, nats_headers: {})
     publish_error(reply_to, status:, error:, headers: nats_headers)
     raise ArgumentError, error unless publish_raw?
@@ -632,8 +811,9 @@ class BridgeCore
     )
 
     context = RequestContext.new(request_id:, initial_state: 'active')
+    attach_flow_windows(context)
     @active_streams[request_id] = context
-    context.upstream_queue = Async::Queue.new if operation == 'tcp_stream'
+    context.upstream_queue = build_session_queue if operation == 'tcp_stream'
     detached_lifecycle = false
     session_close_emitted = false
 
@@ -660,14 +840,17 @@ class BridgeCore
       payload:,
       cancel_check: -> { context.cancel_requested? },
       emit_failure_response: publish_raw?,
-      request_id: request_id,
-      upstream_queue: context.upstream_queue
+      request_id: request_id
     }
 
     if operation == 'tcp_stream'
+      handler_kwargs[:upstream_queue] = context.upstream_queue
+      handler_kwargs[:downstream_credit_window] = context.downstream_credit_window
       handler_kwargs[:detached] = true
       handler_kwargs[:task_parent] = @session_barrier.get
       handler_kwargs[:on_complete] = complete_stream
+    else
+      handler_kwargs[:response_credit_window] = context.response_credit_window
     end
 
     proxy_outcome = handler.call(**handler_kwargs) do |event|
@@ -722,29 +905,54 @@ class BridgeCore
     frame_type = msg.header&.dig('Nats-Frame-Type')
 
     case frame_type
-    when 'session_close'
+    when BridgeProtocol::FRAME_SESSION_CLOSE
       context = @active_streams[session_id]
       unless context&.upstream_queue
         LOGGER.warn "Dropping session close for unknown/non-session stream: session_id=#{session_id}, backend=#{@nats_backend}"
         return
       end
+      context.close_flow_windows(reason: 'session_close')
       context.upstream_queue.push(:session_close)
       LOGGER.info "Session close received via upstream: session_id=#{session_id}, backend=#{@nats_backend}"
-    when 'session_data', 'session_data_upstream', nil
+    when BridgeProtocol::FRAME_SESSION_CREDIT_DOWNSTREAM
+      context = @active_streams[session_id]
+      unless context&.downstream_credit_window
+        LOGGER.warn "Dropping downstream credit for unknown stream: session_id=#{session_id}, backend=#{@nats_backend}"
+        return
+      end
+      grant_flow_credit(
+        context.downstream_credit_window,
+        msg,
+        expected_request_id: session_id,
+        expected_direction: BridgeProtocol::DIRECTION_DOWNSTREAM
+      )
+    when BridgeProtocol::FRAME_SESSION_CREDIT_UPSTREAM
+      context = @pending_requests[session_id]
+      unless context&.upstream_credit_window
+        LOGGER.warn "Dropping upstream credit for unknown stream: session_id=#{session_id}, backend=#{@nats_backend}"
+        return
+      end
+      grant_flow_credit(
+        context.upstream_credit_window,
+        msg,
+        expected_request_id: session_id,
+        expected_direction: BridgeProtocol::DIRECTION_UPSTREAM
+      )
+    when BridgeProtocol::FRAME_SESSION_DATA, BridgeProtocol::FRAME_SESSION_DATA_UPSTREAM, nil
       context = @active_streams[session_id]
       unless context&.upstream_queue
         LOGGER.warn "Dropping upstream session data for unknown stream: session_id=#{session_id}, backend=#{@nats_backend}"
         return
       end
-      @collector.record_session_chunk(request_id: session_id, subject: msg.subject, direction: 'upstream')
+      @collector.record_session_chunk(request_id: session_id, subject: msg.subject, direction: BridgeProtocol::DIRECTION_UPSTREAM, bytes: msg.data.to_s.b.bytesize)
       context.upstream_queue.push(msg.data)
-    when 'session_data_downstream'
+    when BridgeProtocol::FRAME_SESSION_DATA_DOWNSTREAM
       context = @pending_requests[session_id]
       unless context&.tunnel_data_queue
         LOGGER.warn "Dropping downstream session data for unknown stream: session_id=#{session_id}, backend=#{@nats_backend}"
         return
       end
-      @collector.record_session_chunk(request_id: session_id, subject: msg.subject, direction: 'downstream')
+      @collector.record_session_chunk(request_id: session_id, subject: msg.subject, direction: BridgeProtocol::DIRECTION_DOWNSTREAM, bytes: msg.data.to_s.b.bytesize)
       context.tunnel_data_queue.push(msg.data)
     else
       LOGGER.warn "Dropping session frame with unknown type: session_id=#{session_id}, frame_type=#{frame_type}, backend=#{@nats_backend}"

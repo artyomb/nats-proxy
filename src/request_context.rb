@@ -1,10 +1,13 @@
 require_relative 'bridge_protocol'
+require_relative 'flow_credit_window'
 
 class RequestContext
   CANCEL_TAIL_BUDGET = 1
 
   attr_reader :request_id, :response_queue, :cancel_reason
   attr_accessor :request_subject, :receiver_service_id, :worker, :upstream_queue, :tunnel_data_queue
+  attr_accessor :downstream_credit_window, :upstream_credit_window, :response_credit_window
+  attr_accessor :pending_response_credit_bytes
 
   def initialize(request_id:, response_queue: nil, initial_state: 'pending_start')
     @request_id = request_id
@@ -14,6 +17,7 @@ class RequestContext
     @cancel_reason = nil
     @cancel_sent = false
     @cancel_tail_budget = CANCEL_TAIL_BUDGET
+    @pending_response_credit_bytes = 0
     @lock = Mutex.new
   end
 
@@ -30,6 +34,7 @@ class RequestContext
       @state = 'terminal'
       @outcome ||= outcome
     end
+    close_flow_windows(reason: 'terminal')
   end
 
   def outcome
@@ -44,6 +49,7 @@ class RequestContext
       @state = 'cancel_requested'
       @cancel_reason = reason
       @outcome ||= BridgeProtocol::OUTCOME_CANCELED
+      close_flow_windows_locked(reason:)
       :ready
     end
   end
@@ -59,6 +65,7 @@ class RequestContext
       @state = 'cancel_requested'
       @outcome = BridgeProtocol::OUTCOME_CANCELED
       @cancel_reason = reason
+      close_flow_windows_locked(reason:)
       true
     end
   end
@@ -80,13 +87,24 @@ class RequestContext
     synchronized do
       @state = 'terminal'
       @outcome ||= fallback_outcome
+      close_flow_windows_locked(reason: 'terminal')
       @outcome
     end
+  end
+
+  def close_flow_windows(reason: 'closed')
+    synchronized { close_flow_windows_locked(reason:) }
   end
 
   private
 
   def synchronized(&block)
     @lock.synchronize(&block)
+  end
+
+  def close_flow_windows_locked(reason:)
+    [@downstream_credit_window, @upstream_credit_window, @response_credit_window].each do |window|
+      window&.close(reason:)
+    end
   end
 end

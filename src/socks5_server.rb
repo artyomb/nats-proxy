@@ -96,6 +96,7 @@ class Socks5Server
     end
 
     context.receiver_service_id = established['receiver_service_id']
+    grant_initial_downstream_credit(context, session_id)
     send_reply(
       socket,
       REPLY_SUCCEEDED,
@@ -263,6 +264,10 @@ class Socks5Server
       end
 
     socket.write([0x05, code, 0x00, address_type].pack('C4') + address + [port].pack('n'))
+  end
+
+  def grant_initial_downstream_credit(context, session_id)
+    @core.send_session_credit_downstream(session_id, context.receiver_service_id, @core.flow_initial_window_bytes)
   end
 
   def read_exact(socket, size)
