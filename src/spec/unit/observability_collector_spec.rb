@@ -39,6 +39,55 @@ RSpec.describe ObservabilityCollector do
     expect(metrics.fetch(:flow_control)).to include(credits_total: 2, credit_bytes_total: 200, flow_waits_total: 1, flow_timeouts_total: 1)
   end
 
+  it "retains only the ten most recently active request ids" do
+    12.times do |index|
+      collector.record_request_published(request_id: "req-#{index}", subject: "to.req-#{index}", method: "GET", path: "/#{index}")
+    end
+
+    request_ids = collector.flow_events.fetch(:events).map { |event| event[:request_id] }
+
+    expect(request_ids).to eq((2..11).map { |index| "req-#{index}" })
+  end
+
+  it "makes a retained request id recent when it receives another event" do
+    10.times do |index|
+      collector.record_request_published(request_id: "req-#{index}", subject: "to.req-#{index}", method: "GET", path: "/#{index}")
+    end
+    collector.record_response_event(request_id: "req-0", subject: "from.req-0", event: { "type" => "response_chunk", "body" => "still active" })
+    collector.record_request_published(request_id: "req-10", subject: "to.req-10", method: "GET", path: "/10")
+
+    request_ids = collector.flow_events.fetch(:events).map { |event| event[:request_id] }.uniq
+
+    expect(request_ids).to contain_exactly("req-0", *(2..10).map { |index| "req-#{index}" })
+  end
+
+  it "preserves retained event order and content when an older request id is evicted" do
+    collector.record_request_published(request_id: "keep", subject: "to.keep", method: "POST", path: "/stream")
+    collector.record_request_published(request_id: "evict", subject: "to.evict", method: "GET", path: "/old")
+    8.times do |index|
+      collector.record_request_published(request_id: "filler-#{index}", subject: "to.filler-#{index}", method: "GET", path: "/#{index}")
+    end
+    collector.record_response_event(
+      request_id: "keep",
+      subject: "from.keep",
+      event: { "type" => "response_start", "status" => 201, "streaming" => true, "content_type" => "text/event-stream" }
+    )
+    collector.record_request_published(request_id: "new", subject: "to.new", method: "PUT", path: "/new")
+
+    events = collector.flow_events.fetch(:events)
+
+    expect(events.map { |event| event[:request_id] }).to eq([
+      "keep", *(0..7).map { |index| "filler-#{index}" }, "keep", "new"
+    ])
+    expect(events.first).to include(type: "request_published", subject: "to.keep", meta: { method: "POST", path: "/stream" })
+    expect(events[-2]).to include(
+      type: "response_start",
+      subject: "from.keep",
+      meta: { status: 201, streaming: true, content_type: "text/event-stream" }
+    )
+    expect(events.last).to include(type: "request_published", subject: "to.new", meta: { method: "PUT", path: "/new" })
+  end
+
   it "includes jetstream inspection failure as structured observability output" do
     nats_client = instance_double(
       "NatsAsyncRuntime",

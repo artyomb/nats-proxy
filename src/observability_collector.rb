@@ -11,6 +11,7 @@ class ObservabilityCollector
     @role = role
     @backend = backend.to_s
     @events = []
+    @recent_request_ids = []
     @mutex = Mutex.new
   end
 
@@ -400,10 +401,11 @@ class ObservabilityCollector
 
   def append_event(type, request_id:, subject:, meta: {}, nats_payload: nil)
     synchronized do
+      request_id = request_id.to_s
       @events << {
         at: now,
         type: type.to_s,
-        request_id: request_id.to_s,
+        request_id:,
         subject: subject.to_s.empty? ? nil : subject.to_s,
         service_id: @service_id,
         role: @role,
@@ -411,7 +413,7 @@ class ObservabilityCollector
         meta:,
         nats_payload: normalize_nats_payload_string(nats_payload)
       }
-      trim_by_request_id_limit!
+      touch_request_id!(request_id)
     end
   end
 
@@ -484,13 +486,13 @@ class ObservabilityCollector
     ['queued', 'in_progress']
   end
 
-  def trim_by_request_id_limit!
-    request_ids = {}
-    @events.reverse_each do |event|
-      request_ids[event[:request_id]] = true
-      break if request_ids.size >= REQUEST_ID_LIMIT
-    end
-    @events.select! { |event| request_ids.key?(event[:request_id]) }
+  def touch_request_id!(request_id)
+    @recent_request_ids.delete(request_id)
+    @recent_request_ids << request_id
+    return if @recent_request_ids.size <= REQUEST_ID_LIMIT
+
+    evicted_request_id = @recent_request_ids.shift
+    @events.delete_if { |event| event[:request_id] == evicted_request_id }
   end
 
   def feed_health
