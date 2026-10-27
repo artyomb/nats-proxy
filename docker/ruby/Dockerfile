@@ -1,16 +1,21 @@
-FROM ruby:3.4.4-slim-bookworm AS base
+FROM ruby:4.0.9-slim-bookworm AS base
 
-RUN apt update && apt --fix-missing install -y build-essential pkg-config libpq-dev curl cmake libssl-dev libyaml-dev\
+RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-recommends build-essential pkg-config libpq-dev curl cmake libssl-dev libyaml-dev\
      && rm -rf /var/lib/apt/lists/*
 
 RUN echo 'gem: --no-document' >> ~/.gemrc
 
 WORKDIR /app
 
-COPY Gemfile* /app/
+COPY .ruby-version Gemfile Gemfile.lock /app/
 
 RUN bundle install --jobs $(nproc) --retry=3 && \
     bundle clean --force && rm -rf /usr/local/bundle/cache/*
+
+# The bundle replaces the vulnerable default JSON gem (CVE-2026-33210).
+RUN rm -rf /usr/local/lib/ruby/4.0.0/json* /usr/local/lib/ruby/4.0.0/*-linux/json \
+    /usr/local/lib/ruby/gems/4.0.0/gems/json-* \
+    /usr/local/lib/ruby/gems/4.0.0/specifications/default/json-*.gemspec
 
 COPY . /app
 
@@ -20,12 +25,12 @@ RUN rake -T | grep 'rake build' && rake build || echo 'no build task'
 FROM base AS tests
 RUN bundle exec rspec
 
-FROM ruby:3.4.4-slim-bookworm AS deploy
-ARG NATS_SERVER_VERSION=2.11.6
-ARG NATS_CLI_VERSION=0.2.4
+FROM ruby:4.0.9-slim-bookworm AS deploy
+ARG NATS_SERVER_VERSION=2.14.9
+ARG NATS_CLI_VERSION=0.5.1
 ARG TARGETARCH=amd64
 
-RUN apt update && apt install --fix-missing -y bash curl libssl-dev wget libpq-dev libyaml-0-2 ca-certificates unzip\
+RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-recommends bash curl libssl-dev wget libpq-dev libyaml-0-2 ca-certificates unzip\
      && rm -rf /var/lib/apt/lists/*
 
 # Install nats-server binary into runtime image; it is disabled by default.
@@ -46,6 +51,12 @@ RUN set -eux; \
   rm -rf /tmp/nats-server* /tmp/nats* /tmp/nats.zip
 
 COPY --from=base /usr/local/bundle /usr/local/bundle
+
+# The bundle replaces the vulnerable default JSON gem (CVE-2026-33210).
+RUN rm -rf /usr/local/lib/ruby/4.0.0/json* /usr/local/lib/ruby/4.0.0/*-linux/json \
+    /usr/local/lib/ruby/gems/4.0.0/gems/json-* \
+    /usr/local/lib/ruby/gems/4.0.0/specifications/default/json-*.gemspec
+
 COPY --from=docker /ruby/entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
 

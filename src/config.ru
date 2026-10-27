@@ -1,7 +1,6 @@
 require 'async'
 require 'async/queue'
 require 'concurrent-ruby'
-require 'dotenv'
 require 'json'
 require 'securerandom'
 require 'sinatra'
@@ -16,7 +15,6 @@ require_relative 'proxy_auth'
 require_relative 'service_runtime'
 
 StackServiceBase.rack_setup self
-Dotenv.load
 
 UPSTREAM_URL            = ENV['UPSTREAM_URL']
 
