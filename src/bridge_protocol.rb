@@ -115,8 +115,8 @@ module BridgeProtocol
     event
   end
 
-  def session_close_event(reason: 'normal')
-    { 'type' => SESSION_CLOSE, 'reason' => reason.to_s }
+  def session_close_event(reason: 'normal', outcome: OUTCOME_COMPLETED)
+    { 'type' => SESSION_CLOSE, 'reason' => reason.to_s, 'outcome' => outcome }
   end
 
   def flow_credit_payload(request_id:, service_id:, direction:, bytes:, timestamp: nil)

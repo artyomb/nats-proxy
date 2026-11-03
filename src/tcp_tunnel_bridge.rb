@@ -195,6 +195,7 @@ class TcpTunnelBridge
   def pump_receiver_tunnel(task, socket, upstream_queue, cancel_check, session_id, requester_service_id, downstream_credit_window)
     stop = false
     close_reason = 'target_closed'
+    outcome = BridgeProtocol::OUTCOME_COMPLETED
 
     reader = task.async do
       loop do
@@ -208,6 +209,7 @@ class TcpTunnelBridge
         )
         if allowed == FlowCreditWindow::TIMEOUT
           close_reason = 'flow_credit_timeout'
+          outcome = BridgeProtocol::OUTCOME_TIMEOUT
           break
         end
         break unless allowed
@@ -239,7 +241,12 @@ class TcpTunnelBridge
 
         data = upstream_queue.dequeue(timeout: 0.2)
         next if data.nil?
-        break if data == :session_close
+        if data.is_a?(Hash) && data['type'] == BridgeProtocol::SESSION_CLOSE
+          close_reason = data['reason'] || 'client_closed'
+          outcome = data['outcome'] || BridgeProtocol::OUTCOME_COMPLETED
+          downstream_credit_window&.close(reason: 'session_close')
+          break
+        end
 
         written = write_all(socket, data)
         record_socket_write(session_id, BridgeProtocol::DIRECTION_UPSTREAM, written)
@@ -261,10 +268,9 @@ class TcpTunnelBridge
     writer.wait
 
     reason = cancel_check.call ? 'cancel_requested' : close_reason
-    yield BridgeProtocol.session_close_event(reason:)
-    return BridgeProtocol::OUTCOME_TIMEOUT if close_reason == 'flow_credit_timeout'
-
-    cancel_check.call ? BridgeProtocol::OUTCOME_CANCELED : BridgeProtocol::OUTCOME_COMPLETED
+    outcome = BridgeProtocol::OUTCOME_CANCELED if cancel_check.call
+    yield BridgeProtocol.session_close_event(reason:, outcome:)
+    outcome
   rescue => e
     LOGGER.error "Session tunnel error: session_id=#{session_id}, error=#{e.class} - #{e.message}"
     yield BridgeProtocol.error_event("Tunnel error: #{e.message}")
@@ -319,6 +325,7 @@ class TcpTunnelBridge
   def pump_requester_tunnel(task, client_io, context, session_id)
     stop = false
     close_reason = 'client_closed'
+    outcome = BridgeProtocol::OUTCOME_COMPLETED
     done = Async::Notification.new
 
     reader = task.async do
@@ -333,6 +340,7 @@ class TcpTunnelBridge
         )
         if allowed == FlowCreditWindow::TIMEOUT
           close_reason = 'flow_credit_timeout'
+          outcome = BridgeProtocol::OUTCOME_TIMEOUT
           break
         end
         break unless allowed
@@ -350,7 +358,7 @@ class TcpTunnelBridge
 
         @core.send_session_data(session_id, bytes, receiver_service_id: context.receiver_service_id)
       end
-      @core.close_session(session_id, reason: close_reason, receiver_service_id: context.receiver_service_id)
+      @core.close_session(session_id, reason: close_reason, outcome:, receiver_service_id: context.receiver_service_id)
     rescue IOError, Errno::ECONNRESET, Errno::EPIPE
       @core.close_session(session_id, reason: 'client_disconnected', receiver_service_id: context.receiver_service_id)
     ensure
@@ -373,11 +381,11 @@ class TcpTunnelBridge
     end
 
     done.wait
-    reader.stop
-    writer.stop
   rescue => e
     LOGGER.error "Requester tunnel error: session_id=#{session_id}, error=#{e.class} - #{e.message}"
   ensure
+    reader&.stop
+    writer&.stop
     client_io.close rescue nil
     @core.release_pending(session_id)
     LOGGER.info "Requester tunnel closed: session_id=#{session_id}"

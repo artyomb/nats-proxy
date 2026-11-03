@@ -8,14 +8,16 @@ RSpec.describe "HTTP bridge system", :system do
       upstream.on('/raw') do |request|
         { headers: { 'Content-Type' => 'text/plain' }, body: [Digest::SHA256.hexdigest(request.body)] }
       end
-      bodies = ['false', 'null', '"hello"', " { \"value\": true }\n", '', 'ordinary text']
+      bodies = ['false', 'null', '"hello"', " { \"value\": true }\n", '', 'ordinary text', '{"message":"Привет, мир! 🌍"}', 'обычный текст']
       with_service_cluster(mode:, upstream_url: upstream.base_url) do |cluster|
         bodies.each do |body|
           response = http_request(base_url: cluster.fetch(:requester_url), method: 'post', path: '/raw', body:, headers: { 'Content-Type' => 'application/json' })
           expect(response.code).to eq('200'), "body=#{body.inspect}: #{response.body}\n#{cluster.fetch(:requester).logs}\n#{cluster.fetch(:receiver).logs}"
           expect(response.body).to eq(Digest::SHA256.hexdigest(body)), "Changed HTTP body: #{body.inspect}"
         end
-        expect(upstream.requests.map(&:body)).to eq(bodies)
+        expect(upstream.requests.map { |request| request.body.b }).to eq(bodies.map(&:b))
+        events = http_get_json(cluster.fetch(:requester_url), '/observability/flows?event_type=request_published&include_nats_payload=true&limit=20').fetch('events')
+        expect(events.map { |event| JSON.parse(event.fetch('nats_payload'))['operation'] }).to eq(['http_request'] * bodies.length)
       end
     ensure
       upstream&.stop
@@ -159,15 +161,15 @@ RSpec.describe "HTTP bridge system", :system do
       upstream = SystemHttpServer.new
       response_body = Random.new(42).bytes(1_200_000)
       upstream.on('/large') do |request|
-        {
-          status: 201,
-          headers: { 'Content-Type' => 'application/octet-stream', 'X-Body-SHA256' => Digest::SHA256.hexdigest(request.body) },
-          body: [request.body.bytesize > 1_048_576 ? response_body : 'small']
-        }
+        body = request.body.bytesize > 1_048_576 ? response_body : 'small'
+        request.socket.write("HTTP/1.1 201 Created\r\nContent-Type: application/octet-stream\r\nX-Body-SHA256: #{Digest::SHA256.hexdigest(request.body)}\r\nContent-Length: #{body.bytesize}\r\nConnection: keep-alive\r\n\r\n")
+        request.socket.write(body)
+        request.socket.read(1)
+        :handled
       end
 
       with_service_cluster(mode:, upstream_url: upstream.base_url, response_timeout: 10, stream_timeout: 10) do |cluster|
-        bodies = ["{ \"image\": \"#{'A' * 1_200_000}\" }\n", Random.new(43).bytes(1_200_000), "field=#{'x' * 1_100_000}", '{"small":true}']
+        bodies = ["{ \"image\": \"#{'A' * 1_200_000}\" }\n", Random.new(43).bytes(1_200_000), "field=#{'x' * 1_100_000}", '{"small":true}', "\xff\0".b]
         bodies.each_with_index do |body, index|
           content_type = index == 2 ? 'application/x-www-form-urlencoded' : 'application/octet-stream'
           response = http_request(
@@ -185,10 +187,40 @@ RSpec.describe "HTTP bridge system", :system do
         expect(requests.map { |request| request.headers['authorization'] }).to eq(['Bearer test-token'] * bodies.length)
         events = http_get_json(cluster.fetch(:requester_url), '/observability/flows?event_type=request_published&include_nats_payload=true&limit=10')
         operations = events.fetch('events').map { |event| JSON.parse(event.fetch('nats_payload')).fetch('operation') }
-        expect(operations).to eq(%w[tcp_stream tcp_stream tcp_stream http_request])
+        expect(operations).to eq(%w[tcp_stream tcp_stream tcp_stream http_request tcp_stream])
+        completed = wait_until(timeout: 5) do
+          cases = http_get_json(cluster.fetch(:requester_url), '/observability/cases?limit=10').fetch('cases')
+          cases if cases.length == bodies.length && cases.all? { |row| row['status'] == 'completed' }
+        end
+        expect(completed.map { |row| row['outcome'] }).to all(eq('success'))
+        metrics = http_get_json(cluster.fetch(:requester_url), '/observability/metrics')
+        expect(metrics.dig('reconstruction_quality', 'success_ratio')).to eq(1.0)
         runtime = http_get_json(cluster.fetch(:requester_url), '/observability/nats')
         expect(runtime.dig('connection', 'server_info', 'max_payload')).to eq(1_048_576)
         expect(runtime.dig('connection', 'connected')).to eq(true)
+      end
+    ensure
+      upstream&.stop
+    end
+
+    it "records a tunneled HTTP timeout on both sides and closes the upstream in #{mode} mode" do
+      upstream = SystemHttpServer.new
+      disconnects = Queue.new
+      upstream.on('/large-timeout') do |request|
+        request.socket.read(1)
+        disconnects << :closed
+        :handled
+      end
+      with_service_cluster(mode:, upstream_url: upstream.base_url, response_timeout: 1, stream_timeout: 1) do |cluster|
+        response = http_request(base_url: cluster.fetch(:requester_url), method: 'post', path: '/large-timeout', body: 'x' * 1_100_000)
+        expect(response.code).to eq('504'), response.body
+        expect(wait_until(timeout: 5) { disconnects.pop(true) rescue nil }).to eq(:closed)
+        %i[requester_url receiver_url].each do |role_url|
+          row = observability_case_for(cluster.fetch(role_url), path: '/large-timeout', outcome: 'timeout')
+          expect(row).to include('status' => 'timed_out', 'in_progress' => false)
+        end
+        metrics = http_get_json(cluster.fetch(:requester_url), '/observability/metrics')
+        expect(metrics.dig('reconstruction_quality', 'success_ratio')).to eq(0.0)
       end
     ensure
       upstream&.stop
@@ -228,6 +260,8 @@ RSpec.describe "HTTP bridge system", :system do
         expect(socket.readpartial(8192)).to include('data: ')
         socket.close
         expect(wait_until(timeout: 8) { disconnects.pop(true) rescue nil }).to eq(:closed)
+        row = observability_case_for(cluster.fetch(:requester_url), path: '/large-events', outcome: 'canceled')
+        expect(row.fetch('in_progress')).to eq(false)
       end
     ensure
       socket&.close unless socket&.closed?

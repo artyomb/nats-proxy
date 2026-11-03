@@ -202,9 +202,9 @@ class HttpGateway
     BridgeProtocol::OUTCOME_TIMEOUT
   rescue Faraday::ConnectionFailed, Faraday::TimeoutError => e
     error_message = "Upstream unavailable: #{e.message}"
+    outcome = e.is_a?(Faraday::TimeoutError) ? BridgeProtocol::OUTCOME_TIMEOUT : BridgeProtocol::OUTCOME_UPSTREAM_ERROR
 
     if state[:response_started]
-      outcome = e.is_a?(Faraday::TimeoutError) ? BridgeProtocol::OUTCOME_TIMEOUT : BridgeProtocol::OUTCOME_UPSTREAM_ERROR
       yield BridgeProtocol.error_event(error_message, outcome:)
       yield BridgeProtocol.end_event
     elsif emit_failure_response
@@ -215,7 +215,7 @@ class HttpGateway
       raise BridgeProtocol::UpstreamUnavailableError, error_message
     end
 
-    BridgeProtocol::OUTCOME_UPSTREAM_ERROR
+    outcome
   end
 
   def build_start_event(status:, headers:, extra: nil)
@@ -415,7 +415,7 @@ class HttpGateway
     return '' unless input
 
     input.rewind if input.respond_to?(:rewind)
-    input.read
+    input.read.force_encoding(Encoding::UTF_8)
   end
 
   def direct_upstream_request(method:, path:, headers:, body:)
@@ -449,28 +449,29 @@ class HttpGateway
         core: @core, tcp_bridge: @tcp_tunnel_bridge, request_id: context.request_id,
         method:, path:, timeout: @nats_response_timeout
       )
-      proxy_upstream_request(
+      outcome = proxy_upstream_request(
         connection: tunnel.connection, method:, path: tunnel.url, headers:, body:,
         cancel_check: -> { context.cancel_requested? }
       ) { |event| context.response_queue.push(event) }
     rescue BridgeProtocol::PayloadTooLargeError => e
-      enqueue_local_error(context, status: 413, message: e.message)
+      enqueue_local_error(context, status: 413, message: e.message, outcome: BridgeProtocol::OUTCOME_PROTOCOL_ERROR)
     rescue BridgeProtocol::PayloadLimitUnavailableError => e
-      enqueue_local_error(context, status: 503, message: e.message)
+      enqueue_local_error(context, status: 503, message: e.message, outcome: BridgeProtocol::OUTCOME_SESSION_ERROR)
     rescue HttpTunnel::Error => e
-      enqueue_local_error(context, status: e.status, message: e.message)
+      enqueue_local_error(context, status: e.status, message: e.message, outcome: BridgeProtocol::OUTCOME_UPSTREAM_ERROR)
     rescue Timeout::Error, Async::TimeoutError => e
-      enqueue_local_error(context, status: 504, message: e.message)
+      enqueue_local_error(context, status: 504, message: e.message, outcome: BridgeProtocol::OUTCOME_TIMEOUT)
     rescue => e
       LOGGER.error "HTTP tunnel failed: #{e.class} - #{e.message}"
-      enqueue_local_error(context, status: 502, message: e.message)
+      enqueue_local_error(context, status: 502, message: e.message, outcome: BridgeProtocol::OUTCOME_UPSTREAM_ERROR)
     ensure
-      tunnel&.close
+      tunnel&.close(outcome: context.outcome || outcome || BridgeProtocol::OUTCOME_SESSION_ERROR, cancel_reason: context.cancel_reason)
     end
     context
   end
 
-  def enqueue_local_error(context, status:, message:)
+  def enqueue_local_error(context, status:, message:, outcome:)
+    context.mark_terminal!(outcome)
     context.response_queue.push(build_start_event(status:, headers: { 'content-type' => 'application/json' }))
     context.response_queue.push(BridgeProtocol.chunk_event({ error: message }.to_json))
     context.response_queue.push(BridgeProtocol.end_event)

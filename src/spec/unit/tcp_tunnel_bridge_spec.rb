@@ -86,6 +86,30 @@ RSpec.describe TcpTunnelBridge do
     expect(core).to have_received(:send_session_credit_downstream).with("sess-down", "receiver-1", 3)
   end
 
+  it 'preserves typed and legacy close outcomes while waiting for downstream credit' do
+    [nil, BridgeProtocol::OUTCOME_TIMEOUT, BridgeProtocol::OUTCOME_SESSION_ERROR].each do |close_outcome|
+      target, peer = Socket.pair(:UNIX, :STREAM, 0)
+      window = FlowCreditWindow.new(max_bytes: 1024)
+      upstream_queue = Async::Queue.new
+      close_event = { 'type' => 'session_close', 'reason' => 'normal' }
+      close_event['outcome'] = close_outcome if close_outcome
+      upstream_queue.enqueue(close_event)
+      events = []
+      expected = close_outcome || BridgeProtocol::OUTCOME_COMPLETED
+
+      Sync do |task|
+        outcome = task.with_timeout(1) do
+          bridge.send(:pump_receiver_tunnel, task, target, upstream_queue, -> { false }, 'sess-close', 'requester', window) { |event| events << event }
+        end
+        expect(outcome).to eq(expected)
+      end
+      expect(events.last).to include('type' => 'session_close', 'outcome' => expected)
+    ensure
+      target&.close unless target&.closed?
+      peer&.close unless peer&.closed?
+    end
+  end
+
   it "does not close a CONNECT tunnel just because downstream data is temporarily idle" do
     context = RequestContext.new(request_id: "sess-idle")
     context.receiver_service_id = "receiver-1"

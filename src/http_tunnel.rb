@@ -56,26 +56,30 @@ class HttpTunnel
       f.adapter :async_http, clients: ->(**options) { Clients.new(endpoint, **options) }, retries: 1
     end
   rescue Exception
-    close
+    close(outcome: BridgeProtocol::OUTCOME_SESSION_ERROR)
     raise
   end
 
-  def close
+  def close(outcome:, cancel_reason: nil)
     return if @closed
 
     @closed = true
     begin
-      if @context&.receiver_service_id
-        @core.close_session(@context.request_id, reason: 'http_request_finished', receiver_service_id: @context.receiver_service_id)
-      elsif @context
-        @core.cancel_request(@context, reason: 'http_tunnel_failed')
+      Async::Task.current.defer_cancel do
+        if cancel_reason && @context
+          @core.cancel_request(@context, reason: cancel_reason)
+        elsif @context&.receiver_service_id
+          @core.close_session(@context.request_id, reason: 'http_request_finished', outcome:, receiver_service_id: @context.receiver_service_id)
+        elsif @context
+          @core.cancel_request(@context, reason: 'http_tunnel_failed')
+        end
       end
     rescue => e
       LOGGER.warn "HTTP tunnel close failed: #{e.class} - #{e.message}"
     ensure
+      @pump&.stop
       @client_io&.close unless @client_io&.closed?
       @tunnel_io&.close unless @tunnel_io&.closed?
-      @pump&.stop
       @core.release_pending(@context.request_id) if @context
     end
   end

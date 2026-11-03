@@ -1,5 +1,6 @@
 require_relative "../spec_helper"
 require_relative "../../bridge_core"
+require_relative "../../observability_collector"
 
 RSpec.describe BridgeCore do
   MessageDouble = Struct.new(:data, :header, :reply, :subject)
@@ -106,6 +107,33 @@ RSpec.describe BridgeCore do
     client.published.map do |publish|
       message = publish.fetch(:message)
       message.is_a?(String) ? JSON.parse(message) : message
+    end
+  end
+
+  context 'session close publication' do
+    let(:collector) { ObservabilityCollector.new(service_id: 'srv-test', role: 'requester', backend: 'core') }
+
+    it 'records a failed publication as a session error instead of a completed session' do
+      client = FakeNatsClient.new
+      allow(client).to receive(:publish).and_raise(IOError, 'NATS connection closed')
+      core = build_core(nats_client: client)
+
+      expect { core.close_session('sess-failed', receiver_service_id: 'receiver') }.to raise_error(IOError, 'NATS connection closed')
+
+      expect(collector.flow_cases.fetch(:cases).first).to include(status: 'failed', outcome: 'error')
+      events = collector.flow_events('include_nats_payload' => true).fetch(:events)
+      expect(events.map { |event| event[:type] }).to eq(['response_error'])
+      expect(events.first.dig(:meta, :outcome)).to eq(BridgeProtocol::OUTCOME_SESSION_ERROR)
+      expect(events.first[:nats_payload]).to be_nil
+    end
+
+    it 'preserves the explicit timeout outcome independently of the close reason' do
+      client = FakeNatsClient.new
+      core = build_core(nats_client: client)
+      core.close_session('sess-timeout', reason: 'normal', outcome: BridgeProtocol::OUTCOME_TIMEOUT, receiver_service_id: 'receiver')
+
+      expect(decode_published_messages(client).first).to include('type' => 'session_close', 'outcome' => 'timeout')
+      expect(collector.flow_cases.fetch(:cases).first).to include(status: 'timed_out', outcome: 'timeout')
     end
   end
 

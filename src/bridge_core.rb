@@ -207,15 +207,24 @@ class BridgeCore
     )
   end
 
-  def close_session(session_id, reason: 'normal', receiver_service_id:)
+  def close_session(session_id, reason: 'normal', outcome: BridgeProtocol::OUTCOME_COMPLETED, receiver_service_id:)
+    subject = session_upstream_subject(receiver_service_id, session_id)
+    event = BridgeProtocol.session_close_event(reason:, outcome:)
     publish_message(
-      BridgeProtocol.session_close_event(reason:).to_json,
-      session_upstream_subject(receiver_service_id, session_id),
+      event.to_json,
+      subject,
       headers: {
         'Nats-Session-Id' => session_id,
         'Nats-Frame-Type' => BridgeProtocol::FRAME_SESSION_CLOSE
       }
     )
+    @collector.record_response_event(request_id: session_id, subject:, event:)
+  rescue => e
+    @collector.record_response_event(
+      request_id: session_id, subject: nil, nats_body: nil,
+      event: BridgeProtocol.error_event("Session close publication failed: #{e.message}", outcome: BridgeProtocol::OUTCOME_SESSION_ERROR)
+    )
+    raise
   end
 
   def process_response_event(msg)
@@ -929,8 +938,12 @@ class BridgeCore
         LOGGER.warn "Dropping session close for unknown/non-session stream: session_id=#{session_id}, backend=#{@nats_backend}"
         return
       end
-      context.close_flow_windows(reason: 'session_close')
-      context.upstream_queue.push(:session_close)
+      event = BridgeProtocol.parse_event(msg.data.to_s)
+      unless event && event['type'] == BridgeProtocol::SESSION_CLOSE
+        LOGGER.warn "Dropping invalid session close: session_id=#{session_id}, backend=#{@nats_backend}"
+        return
+      end
+      context.upstream_queue.push(event)
       LOGGER.info "Session close received via upstream: session_id=#{session_id}, backend=#{@nats_backend}"
     when BridgeProtocol::FRAME_SESSION_CREDIT_DOWNSTREAM
       context = @active_streams[session_id]

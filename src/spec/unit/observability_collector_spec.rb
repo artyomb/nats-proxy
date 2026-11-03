@@ -29,6 +29,29 @@ RSpec.describe ObservabilityCollector do
     expect(collector.flow_events('outcome' => 'error').fetch(:events).map { |event| event[:request_id] }).to include('req-error', 'req-legacy')
   end
 
+  it 'counts a session completion once when both peers close it' do
+    collector.record_request_published(request_id: 'session', subject: 'requests.session', method: 'POST', path: '/large')
+    collector.record_response_event(request_id: 'session', subject: 'sessions.upstream.session', event: { 'type' => 'session_close', 'reason' => 'client_closed' })
+    collector.record_response_event(request_id: 'session', subject: 'responses.session', event: { 'type' => 'session_close', 'reason' => 'target_closed' })
+
+    expect(collector.metrics.fetch(:reconstruction_quality).fetch(:success_ratio)).to eq(1.0)
+    expect(collector.flow_cases.fetch(:cases).first).to include(status: 'completed', outcome: 'success')
+  end
+
+  it 'keeps unsuccessful session outcomes after a peer sends a successful close' do
+    { 'timeout' => 'timed_out', 'canceled' => 'canceled', 'session_error' => 'failed' }.each do |outcome, status|
+      collector.record_request_published(request_id: outcome, subject: "requests.#{outcome}", method: 'POST', path: '/large')
+      collector.record_response_event(request_id: outcome, subject: "sessions.#{outcome}", event: { 'type' => 'session_close', 'reason' => 'normal', 'outcome' => outcome })
+      collector.record_response_event(request_id: outcome, subject: "responses.#{outcome}", event: { 'type' => 'session_close', 'outcome' => 'completed' })
+
+      row = collector.flow_cases('request_id' => outcome).fetch(:cases).first
+      expect(row).to include(status:, in_progress: false)
+    end
+
+    expect(collector.metrics.fetch(:reconstruction_quality).fetch(:success_ratio)).to eq(0.0)
+    expect(collector.metrics.fetch(:reconstruction_quality).fetch(:failed_ratio)).to eq(0.6667)
+  end
+
   it "aggregates flow-control events in cases and metrics" do
     collector.record_request_published(request_id: "req-flow", subject: "to.req-flow", method: "GET", path: "/stream")
     collector.record_flow_credit_sent(request_id: "req-flow", subject: "to.proxy.control.receiver.req-flow", direction: "response", bytes: 100)

@@ -725,6 +725,16 @@ module SystemHelpers
         receiver_url: receiver.base_url,
         socks5_port: requester.env_fetch("SOCKS5_LISTEN_PORT")&.to_i
       )
+    rescue StandardError
+      [requester, receiver].compact.each do |process|
+        begin
+          warn "Case diagnostics (#{process.base_url}): #{http_get_json(process.base_url, '/observability/cases?limit=10').fetch('cases').to_json}"
+        rescue StandardError => error
+          warn "Could not read observability diagnostics: #{error.message}"
+        end
+        warn "Service diagnostics (#{process.base_url}):\n#{process.logs.lines.last(50).join}"
+      end
+      raise
     ensure
       requester&.stop
       receiver&.stop

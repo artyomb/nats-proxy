@@ -212,8 +212,9 @@ RSpec.describe HttpGateway do
     events = []
     outcome = gateway.proxy_upstream_request(connection: connection, method: "GET", path: "/stream") { |event| events << event }
 
-    expect(outcome).to eq(BridgeProtocol::OUTCOME_UPSTREAM_ERROR)
+    expect(outcome).to eq(BridgeProtocol::OUTCOME_TIMEOUT)
     expect(events.map { |event| event["type"] }).to eq(%w[response_start response_chunk response_error response_end])
+    expect(events.find { |event| event['type'] == 'response_error' }).to include('outcome' => BridgeProtocol::OUTCOME_TIMEOUT)
   end
 
   it "does not emit streaming response chunks before response credit is available" do

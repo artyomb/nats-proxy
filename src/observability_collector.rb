@@ -40,7 +40,7 @@ class ObservabilityCollector
     )
   end
 
-  def record_response_event(request_id:, subject:, event:, nats_body: nil)
+  def record_response_event(request_id:, subject:, event:, nats_body: event)
     return unless event.is_a?(Hash)
 
     event_type = event['type'].to_s
@@ -62,12 +62,14 @@ class ObservabilityCollector
         }
       when 'response_error'
         { error: event['error'], outcome: event['outcome'] }
+      when 'session_close'
+        { reason: event['reason'], outcome: event['outcome'] }
       else
         {}
       end
 
-    wire_source = nats_body.nil? ? event : nats_body
-    wire_source = event.merge('http_headers' => '[REDACTED]') if event.key?('http_headers')
+    wire_source = nats_body
+    wire_source = event.merge('http_headers' => '[REDACTED]') if wire_source && event.key?('http_headers')
     append_event(event_type, request_id:, subject:, meta: normalized, nats_payload: encode_nats_wire(wire_source))
   end
 
@@ -194,7 +196,11 @@ class ObservabilityCollector
   def metrics(window_sec: METRIC_BUCKET_SECONDS)
     recent = synchronized { @events.select { |event| event[:at] >= now - window_sec } }
     request_count = recent.count { |event| event[:type] == 'request_published' }
-    response_end_count = recent.count { |event| %w[response_end session_close].include?(event[:type]) }
+    finished_requests = recent.select { |event| %w[response_end session_close].include?(event[:type]) }.map { |event| event[:request_id] }
+    response_end_count = finished_requests.uniq.size
+    case_statuses = recent.group_by { |event| event[:request_id] }.values.map { |events| case_status_and_outcome(events).first }
+    successful_count = case_statuses.count('completed')
+    failed_count = case_statuses.count { |status| %w[failed timed_out].include?(status) }
     response_error_count = recent.count { |event| event[:type] == 'response_error' }
     cancel_count = recent.count { |event| %w[cancel_published cancel_observed].include?(event[:type]) }
     credit_count = recent.count { |event| %w[flow_credit_sent flow_credit_received].include?(event[:type]) }
@@ -221,8 +227,8 @@ class ObservabilityCollector
         flow_timeouts_total: flow_timeout_count
       },
       reconstruction_quality: {
-        success_ratio: request_count.zero? ? 1.0 : (response_end_count.to_f / request_count).round(4),
-        failed_ratio: request_count.zero? ? 0.0 : (response_error_count.to_f / request_count).round(4)
+        success_ratio: request_count.zero? ? 1.0 : (successful_count.to_f / request_count).round(4),
+        failed_ratio: request_count.zero? ? 0.0 : (failed_count.to_f / request_count).round(4)
       }
     }
   end
@@ -449,10 +455,12 @@ class ObservabilityCollector
 
   def event_outcome(event)
     case event[:type]
-    when 'response_error'
+    when 'response_error', 'session_close'
       outcome = event.dig(:meta, :outcome)
+      return 'success' if event[:type] == 'session_close' && (outcome.to_s.empty? || outcome == 'completed')
+
       %w[timeout canceled].include?(outcome) ? outcome : 'error'
-    when 'response_end', 'session_close'
+    when 'response_end'
       'success'
     when 'cancel_published', 'cancel_observed'
       'canceled'
@@ -470,7 +478,7 @@ class ObservabilityCollector
     has_start = request_events.any? { |event| %w[response_start session_established].include?(event[:type]) }
     has_end = request_events.any? { |event| %w[response_end session_close].include?(event[:type]) }
     has_cancel = request_events.any? { |event| %w[cancel_published cancel_observed].include?(event[:type]) }
-    error_event = request_events.reverse.find { |event| event[:type] == 'response_error' }
+    error_event = request_events.reverse.find { |event| %w[response_error session_close].include?(event[:type]) && event_outcome(event) != 'success' }
     error_outcome = error_event && event_outcome(error_event)
 
     return ['canceled', 'canceled'] if has_cancel || error_outcome == 'canceled'

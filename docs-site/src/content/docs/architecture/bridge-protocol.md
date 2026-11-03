@@ -51,7 +51,7 @@ For HTTP requests, `payload.path` can be:
 - a normal origin-form path such as `/v1/models`, forwarded relative to `UPSTREAM_URL`;
 - an absolute HTTP URL such as `http://example.com/path`, used by HTTP proxy traffic.
 
-`HttpGateway` strips hop-by-hop request headers before forwarding. `GET` and `HEAD` do not send a request body. Other methods carry the original HTTP body as a string, preserving whitespace, JSON scalars and quoting. The receiver still accepts legacy parsed JSON bodies. Binary bodies that cannot be serialized in the envelope use the TCP tunnel.
+`HttpGateway` strips hop-by-hop request headers before forwarding. `GET` and `HEAD` do not send a request body. Other methods carry the original HTTP body as a string, preserving whitespace, JSON scalars and quoting. Rack body strings are tagged as UTF-8 without transcoding: small valid UTF-8 bodies retain the JSON path, while invalid UTF-8 bodies use the TCP tunnel. The receiver still accepts legacy parsed JSON bodies.
 
 ## Oversized HTTP Requests
 
@@ -226,6 +226,12 @@ sequenceDiagram
 Cancellation is best effort: late response events may already be in flight when the cancel envelope reaches the receiver.
 
 For observability, request contexts store outcomes such as `completed`, `canceled`, `timeout`, `upstream_error`, `protocol_error`, and `session_error`. The case API derives user-facing outcomes from events: `success`, `error`, `timeout`, `canceled`, or `in_progress`.
+
+The requester records an outgoing `session_close` after publication succeeds. During HTTP tunnel cleanup, Async cancellation is deferred until publication and recording finish, including any JetStream acknowledgment. A failed close publication records a local `response_error` with `outcome=session_error` and no wire payload instead of a successful close. This lets the case API finish a locally closed tunnel even if the peer's final event arrives after cleanup.
+
+The existing close event carries an explicit `outcome`; older close events without this field retain their successful-close meaning. Timeout and error classification never depends on the reason text. The receiver preserves the close outcome and releases its credit wait after consuming the ordered close frame. A downstream HTTP disconnect sends the existing cancel envelope before tunnel cleanup. Requester pumps stop both child tasks before closing their socket, including when canceled, so cleanup does not trigger another close publication through a socket error.
+
+Completion metrics count unique request ids. Reconstruction ratios use case outcomes, so failed, timed out and canceled cases do not contribute to the success ratio.
 
 ## Binary Safety
 
