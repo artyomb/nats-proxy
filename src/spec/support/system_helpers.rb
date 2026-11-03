@@ -3,6 +3,7 @@
 require "base64"
 require "json"
 require "net/http"
+require "openssl"
 require "thread"
 require "uri"
 require "securerandom"
@@ -18,15 +19,17 @@ class SystemHttpServer
 
   attr_reader :port
 
-  def initialize
+  def initialize(ssl_context: nil)
     @server = TCPServer.new("127.0.0.1", 0)
+    @listener = ssl_context ? OpenSSL::SSL::SSLServer.new(@server, ssl_context) : @server
+    @scheme = ssl_context ? 'https' : 'http'
     @port = @server.addr[1]
     @handlers = {}
     @requests = Queue.new
     @thread = Thread.new { accept_loop }
   end
 
-  def base_url = "http://127.0.0.1:#{port}"
+  def base_url = "#{@scheme}://#{@scheme == 'https' ? 'localhost' : '127.0.0.1'}:#{port}"
 
   def on(path, &block)
     @handlers[path] = block
@@ -50,7 +53,7 @@ class SystemHttpServer
 
   def accept_loop
     loop do
-      socket = @server.accept
+      socket = @listener.accept
       Thread.new(socket) { |client| handle_client(client) }
     end
   rescue IOError, Errno::EBADF
@@ -643,8 +646,8 @@ module SystemHelpers
     service&.stop
   end
 
-  def with_service_cluster(mode:, upstream_url:, socks5: false, proxy_auth_users_json: nil, response_timeout: 2, stream_timeout: 2, receiver_max_inflight: 20)
-    with_leaf_topology_nats do |nats_context|
+  def with_service_cluster(mode:, upstream_url:, socks5: false, proxy_auth_users_json: nil, response_timeout: 2, stream_timeout: 2, receiver_max_inflight: 20, nats_max_payload: nil)
+    with_leaf_topology_nats(max_payload: nats_max_payload) do |nats_context|
       stream_name = "system-#{mode}-#{SecureRandom.hex(3)}"
       if mode == :jetstream
         bootstrap_jetstream!(nats_url: nats_context.fetch(:proxy_url), stream: stream_name)

@@ -43,7 +43,16 @@ RSpec.describe BridgeProtocol do
       queue.enqueue({ "type" => "response_chunk", "body" => "llo" }.to_json)
       queue.enqueue({ "type" => "response_end" }.to_json)
 
-      expect(described_class.collect_non_streaming_body(queue, timeout: 0.1)).to eq("hello")
+      consumed = []
+      expect(described_class.collect_non_streaming_body(queue, timeout: 0.1) { |chunk| consumed << chunk }).to eq("hello")
+      expect(consumed).to eq(['he', 'llo'])
+    end
+
+    it 'preserves the structured error when an ordinary response fails' do
+      queue = Async::Queue.new
+      queue.enqueue(described_class.error_event('Deadline exceeded', outcome: described_class::OUTCOME_TIMEOUT))
+      expect { described_class.collect_non_streaming_body(queue, timeout: 0.1) }
+        .to raise_error(BridgeProtocol::ResponseStreamError, 'Deadline exceeded') { |error| expect(error.event['outcome']).to eq('timeout') }
     end
   end
 

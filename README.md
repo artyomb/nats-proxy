@@ -109,6 +109,7 @@ Clients can use the `nats-proxy` endpoint in these ways:
 ## Capabilities
 
 - Core NATS and JetStream backends.
+- Automatic HTTP-over-TCP tunneling when the serialized HTTP request exceeds the connected NATS server's `max_payload`; smaller requests keep the JSON bridge path.
 - Multi-instance requester/receiver topologies with receiver-balanced flow starts.
 - Binary-safe chunk transport using base64 when a response chunk is not valid UTF-8.
 - Flow control for streaming HTTP responses and TCP tunnels, so large transfers are paced by the side that consumes them.

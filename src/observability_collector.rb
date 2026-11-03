@@ -61,12 +61,13 @@ class ObservabilityCollector
           body_encoding: event['body_encoding']
         }
       when 'response_error'
-        { error: event['error'] }
+        { error: event['error'], outcome: event['outcome'] }
       else
         {}
       end
 
     wire_source = nats_body.nil? ? event : nats_body
+    wire_source = event.merge('http_headers' => '[REDACTED]') if event.key?('http_headers')
     append_event(event_type, request_id:, subject:, meta: normalized, nats_payload: encode_nats_wire(wire_source))
   end
 
@@ -449,12 +450,8 @@ class ObservabilityCollector
   def event_outcome(event)
     case event[:type]
     when 'response_error'
-      error_text = event.dig(:meta, :error).to_s.downcase
-      if error_text.include?('timeout') || error_text.include?('gateway timeout')
-        'timeout'
-      else
-        'error'
-      end
+      outcome = event.dig(:meta, :outcome)
+      %w[timeout canceled].include?(outcome) ? outcome : 'error'
     when 'response_end', 'session_close'
       'success'
     when 'cancel_published', 'cancel_observed'
@@ -474,10 +471,10 @@ class ObservabilityCollector
     has_end = request_events.any? { |event| %w[response_end session_close].include?(event[:type]) }
     has_cancel = request_events.any? { |event| %w[cancel_published cancel_observed].include?(event[:type]) }
     error_event = request_events.reverse.find { |event| event[:type] == 'response_error' }
-    timeout_error = error_event && event_outcome(error_event) == 'timeout'
+    error_outcome = error_event && event_outcome(error_event)
 
-    return ['canceled', 'canceled'] if has_cancel
-    return ['timed_out', 'timeout'] if timeout_error
+    return ['canceled', 'canceled'] if has_cancel || error_outcome == 'canceled'
+    return ['timed_out', 'timeout'] if error_outcome == 'timeout'
     return ['failed', 'error'] if error_event
     return ['completed', 'success'] if has_end
     return ['in_progress', 'in_progress'] if has_start

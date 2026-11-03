@@ -161,7 +161,7 @@ module NatsServerHelper
     end
   end
 
-  def with_leaf_topology_nats
+  def with_leaf_topology_nats(max_payload: nil)
     attempts = 0
 
     begin
@@ -181,6 +181,7 @@ module NatsServerHelper
               proxy_password:,
               store_dir:
             ))
+            config.write("\nmax_payload: #{Integer(max_payload)}\n") if max_payload
             config.flush
 
             context = {

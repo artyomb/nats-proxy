@@ -52,6 +52,31 @@ RSpec.describe NatsAsyncRuntime do
       .to raise_error(ArgumentError, /Invalid NATS_MODE/)
   end
 
+  it "checks the serialized payload and NATS headers before publishing" do
+    runtime = described_class.new('nats://127.0.0.1:4222', backend_mode: :core)
+    fake_client = FakeAsyncClient.new
+    allow(runtime).to receive(:build_client).and_return(fake_client)
+    Sync do |task|
+      runtime.start(task:, stream: 'proxy')
+      expect(runtime.payload_fits?('x' * 4096)).to eq(true)
+      expect(runtime.payload_fits?('x' * 4097)).to eq(false)
+      expect { runtime.publish('x' * 4096, 'boundary') }.not_to raise_error
+      expect { runtime.publish('x' * 4097, 'boundary') }
+        .to raise_error(BridgeProtocol::PayloadTooLargeError, /4097.*4096/)
+      headers = { 'traceparent' => 'test' }
+      overhead = "NATS/1.0\r\ntraceparent: test\r\n\r\n".bytesize
+      expect(runtime.payload_fits?('x' * (4096 - overhead), headers:)).to eq(true)
+      expect(runtime.payload_fits?('x' * (4097 - overhead), headers:)).to eq(false)
+      expect(runtime.payload_fits?({ body: "\xff".b })).to eq(false)
+      expect { runtime.publish('x' * (4096 - overhead), 'boundary', headers:) }.not_to raise_error
+      expect { runtime.publish('x' * (4097 - overhead), 'boundary', headers:) }
+        .to raise_error(BridgeProtocol::PayloadTooLargeError)
+      expect(runtime.connection_snapshot[:connected]).to eq(true)
+    ensure
+      runtime.close
+    end
+  end
+
   it "starts, publishes and closes through the configured client" do
     runtime = described_class.new("nats://127.0.0.1:4222", backend_mode: :auto)
     fake_client = FakeAsyncClient.new
@@ -68,6 +93,27 @@ RSpec.describe NatsAsyncRuntime do
     expect(fake_client.jetstream.published.first).to include(subject: "subject.js", payload: "{\"ping\":true}")
     expect(runtime.close).to be(true)
     expect(runtime.ready?).to be(false)
+  end
+
+  it 'refuses publication when the broker payload limit is unknown or invalid' do
+    runtime = described_class.new('nats://127.0.0.1:4222', backend_mode: :core)
+    fake_client = FakeAsyncClient.new
+    allow(runtime).to receive(:build_client).and_return(fake_client)
+    expect(fake_client).not_to receive(:publish)
+    Sync do |task|
+      runtime.start(task:, stream: 'proxy')
+      [nil, {}, { max_payload: 0 }, { max_payload: 'invalid' }].each do |info|
+        allow(fake_client).to receive(:server_info).and_return(info)
+        expect { runtime.payload_fits?('small') }.to raise_error(BridgeProtocol::PayloadLimitUnavailableError)
+        expect { runtime.publish('small', 'subject') }.to raise_error(BridgeProtocol::PayloadLimitUnavailableError)
+        expect(runtime.connection_snapshot[:max_payload]).to be_nil
+      end
+      allow(fake_client).to receive(:server_info).and_raise(IOError, 'INFO is unavailable')
+      expect { runtime.max_payload }.to raise_error(BridgeProtocol::PayloadLimitUnavailableError, /INFO is unavailable/)
+    ensure
+      runtime.close
+    end
+    expect(runtime.connection_snapshot[:max_payload]).to be_nil
   end
 
   it "publishes and receives a request envelope in core mode", :nats_server do

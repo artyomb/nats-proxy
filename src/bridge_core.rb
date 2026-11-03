@@ -93,18 +93,18 @@ class BridgeCore
     @operation_handlers[operation_kind.to_s] = handler
   end
 
+  def bridge_request_fits?(request_id:, operation: 'http_request', payload:)
+    message = request_message(request_id:, operation:, payload:)
+    @nats_client.payload_fits?(message, headers: trace_headers(payload['headers']))
+  end
+
   def bridge_request(request_id:, operation: 'http_request', payload:)
+    message = request_message(request_id:, operation:, payload:)
+    @nats_client.check_payload_size!(message, headers: trace_headers(payload['headers']))
     context = RequestContext.new(request_id:)
     attach_flow_windows(context)
     context.request_subject = subject_for_request(request_id)
     @pending_requests[request_id] = context
-
-    message = BridgeProtocol.request_envelope(
-      request_id:,
-      reply_to: subject_for_response(request_id),
-      operation:,
-      payload:
-    )
     @collector.record_request_published(
       request_id:,
       subject: context.request_subject,
@@ -116,32 +116,37 @@ class BridgeCore
     LOGGER.info "Published bridge request: request_id=#{request_id}, operation=#{operation}, backend=#{@nats_backend}, request_subject=#{context.request_subject}"
 
     context
+  rescue
+    @pending_requests.delete(request_id)
+    raise
   end
 
   def bridge_session_open(session_id:, payload:)
+    message = request_message(
+      request_id: session_id,
+      operation: 'tcp_stream',
+      payload: payload.merge('requester_service_id' => @service_id)
+    )
+    @nats_client.check_payload_size!(message)
     context = RequestContext.new(request_id: session_id)
     attach_flow_windows(context)
     context.request_subject = subject_for_request(session_id)
     context.tunnel_data_queue = build_session_queue
     @pending_requests[session_id] = context
-
-    message = BridgeProtocol.request_envelope(
-      request_id: session_id,
-      reply_to: subject_for_response(session_id),
-      operation: 'tcp_stream',
-      payload: payload.merge('requester_service_id' => @service_id)
-    )
     @collector.record_request_published(
       request_id: session_id,
       subject: context.request_subject,
       method: payload['method'],
-      path: "#{payload['host']}:#{payload['port']}",
+      path: payload['path'] || "#{payload['host']}:#{payload['port']}",
       nats_body: message
     )
     publish_message(message, context.request_subject)
     LOGGER.info "Published session open: session_id=#{session_id}, target=#{payload['host']}:#{payload['port']}, backend=#{@nats_backend}"
 
     context
+  rescue
+    @pending_requests.delete(session_id)
+    raise
   end
 
   def cancel_request(context, reason:)
@@ -453,6 +458,10 @@ class BridgeCore
 
   private
 
+  def request_message(request_id:, operation:, payload:)
+    BridgeProtocol.request_envelope(request_id:, reply_to: subject_for_response(request_id), operation:, payload:)
+  end
+
   def listener_alive?(task_handle)
     !!task_handle && !task_handle.finished?
   rescue NoMethodError
@@ -570,6 +579,17 @@ class BridgeCore
   def publish_event(reply_to, event, raw:, headers: {})
     return unless reply_to
 
+    if event['type'] == BridgeProtocol::RESPONSE_CHUNK && !@nats_client.payload_fits?(event, headers:)
+      body = BridgeProtocol.chunk_body(event)
+      if body.bytesize > 1
+        middle = body.bytesize / 2
+        [body.byteslice(0, middle), body.byteslice(middle..)].each do |part|
+          publish_event(reply_to, BridgeProtocol.chunk_event(part), raw:, headers:)
+        end
+        return
+      end
+    end
+
     request_id = reply_to.to_s.split('.').last
     @collector.record_response_event(request_id:, subject: reply_to, event:)
     @nats_client.publish(event.to_json, reply_to, nil, raw:, headers:)
@@ -590,7 +610,7 @@ class BridgeCore
   end
 
   def publish_cancel_diagnostic(reply_to, reason:, headers: {})
-    publish_event(reply_to, BridgeProtocol.error_event("stream canceled: #{reason}"), raw: publish_raw?, headers:)
+    publish_event(reply_to, BridgeProtocol.error_event("stream canceled: #{reason}", outcome: BridgeProtocol::OUTCOME_CANCELED), raw: publish_raw?, headers:)
     publish_event(reply_to, BridgeProtocol.end_event, raw: publish_raw?, headers:)
   end
 
@@ -796,9 +816,7 @@ class BridgeCore
 
     unless handler
       error_message = "No handler registered for operation=#{operation}"
-      return publish_error(reply_to, status: 503, error: error_message, headers: nats_headers) if publish_raw?
-
-      raise BridgeProtocol::UpstreamUnavailableError, error_message
+      return publish_error(reply_to, status: 503, error: error_message, headers: nats_headers)
     end
 
     LOGGER.info "Processing bridge request: request_id=#{request_id}, operation=#{operation}, backend=#{@nats_backend}, reply_to=#{reply_to}"

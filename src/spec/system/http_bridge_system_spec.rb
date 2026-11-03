@@ -2,6 +2,273 @@ require "digest"
 require_relative "../spec_helper"
 
 RSpec.describe "HTTP bridge system", :system do
+  shared_examples 'transparent HTTP bodies' do |mode|
+    it "preserves small request bodies byte for byte in #{mode} mode" do
+      upstream = SystemHttpServer.new
+      upstream.on('/raw') do |request|
+        { headers: { 'Content-Type' => 'text/plain' }, body: [Digest::SHA256.hexdigest(request.body)] }
+      end
+      bodies = ['false', 'null', '"hello"', " { \"value\": true }\n", '', 'ordinary text']
+      with_service_cluster(mode:, upstream_url: upstream.base_url) do |cluster|
+        bodies.each do |body|
+          response = http_request(base_url: cluster.fetch(:requester_url), method: 'post', path: '/raw', body:, headers: { 'Content-Type' => 'application/json' })
+          expect(response.code).to eq('200'), "body=#{body.inspect}: #{response.body}\n#{cluster.fetch(:requester).logs}\n#{cluster.fetch(:receiver).logs}"
+          expect(response.body).to eq(Digest::SHA256.hexdigest(body)), "Changed HTTP body: #{body.inspect}"
+        end
+        expect(upstream.requests.map(&:body)).to eq(bodies)
+      end
+    ensure
+      upstream&.stop
+    end
+
+    it "paces large ordinary responses within the encoded NATS limit in #{mode} mode" do
+      upstream = SystemHttpServer.new
+      body = "\0" * 1_200_000
+      upstream.on('/large-response') do |_request|
+        { headers: { 'Content-Type' => 'application/octet-stream' }, body: [body] }
+      end
+      with_service_cluster(mode:, upstream_url: upstream.base_url, nats_max_payload: 8192, response_timeout: 10, stream_timeout: 10) do |cluster|
+        response = http_request(base_url: cluster.fetch(:requester_url), method: 'get', path: '/large-response')
+        expect(response.code).to eq('200'), response.body.to_s.byteslice(0, 500)
+        expect(response.body.bytesize).to eq(body.bytesize)
+        expect(Digest::SHA256.hexdigest(response.body)).to eq(Digest::SHA256.hexdigest(body))
+        row = observability_case_for(cluster.fetch(:requester_url), path: '/large-response', outcome: 'success')
+        expect(row.fetch('credits_total')).to be > 0
+        expect(row.fetch('flow_timeouts_total')).to eq(0)
+        runtime = http_get_json(cluster.fetch(:requester_url), '/observability/nats')
+        expect(runtime.dig('connection', 'last_error')).to be_nil
+      end
+    ensure
+      upstream&.stop
+    end
+  end
+
+  include_examples 'transparent HTTP bodies', :core
+  include_examples 'transparent HTTP bodies', :jetstream
+
+  shared_examples "large HTTP requests" do |mode|
+    it "preserves upstream authentication defaults and client overrides in #{mode} mode" do
+      upstream = SystemHttpServer.new
+      basic_auth = 'Basic ' + Base64.strict_encode64('alice:fixture-password')
+      upstream.on('/auth') do |request|
+        auth = request.headers['authorization']
+        { status: auth ? 200 : 401, body: [auth || 'missing'] }
+      end
+      upstream_url = upstream.base_url.sub('http://', 'http://alice:fixture-password@')
+
+      with_service_cluster(mode:, upstream_url:, response_timeout: 10, stream_timeout: 10) do |cluster|
+        ['{}', 'x' * 1_100_000].each do |body|
+          [nil, 'Bearer client-token'].each do |authorization|
+            headers = { 'Content-Type' => 'application/octet-stream' }
+            headers['Authorization'] = authorization if authorization
+            response = http_request(base_url: cluster.fetch(:requester_url), method: 'post', path: '/auth', body:, headers:)
+            expect(response.code).to eq('200'), response.body
+            expect(response.body).to eq(authorization || basic_auth)
+          end
+        end
+        %i[requester_url receiver_url].each do |role_url|
+          events = http_get_json(cluster.fetch(role_url), '/observability/flows?event_type=session_established&include_nats_payload=true&limit=10').fetch('events')
+          expect(events).not_to be_empty
+          captures = events.map { |event| JSON.parse(event.fetch('nats_payload')) }
+          expect(captures.map { |event| event['http_headers'] }).to all(eq('[REDACTED]'))
+          expect(events.to_json).not_to include(basic_auth)
+        end
+      end
+    ensure
+      upstream&.stop
+    end
+
+    it "limits concurrent HTTP work regardless of request transport in #{mode} mode" do
+      upstream = SystemHttpServer.new
+      entered = Queue.new
+      release = Queue.new
+      threads = []
+      upstream.on('/concurrency') do |_request|
+        entered << :started
+        release.pop
+        { body: ['done'] }
+      end
+      small = '{}'
+      large = 'x' * 1_100_000
+
+      with_service_cluster(mode:, upstream_url: upstream.base_url, receiver_max_inflight: 1, response_timeout: 10, stream_timeout: 10) do |cluster|
+        [[small, small], [large, large], [large, small]].each do |bodies|
+          threads = bodies.map do |body|
+            Thread.new do
+              http_request(base_url: cluster.fetch(:requester_url), method: 'post', path: '/concurrency', body:, headers: { 'Content-Type' => 'application/octet-stream' })
+            end
+          end
+          wait_until(timeout: 5) { entered.size >= 1 }
+          sleep 0.5
+          expect(entered.size).to eq(1), "Overlapping HTTP requests: #{bodies.map(&:bytesize)}"
+          entered.pop
+          release << :done
+          expect(wait_until(timeout: 5) { entered.pop(true) rescue nil }).to eq(:started)
+          release << :done
+          expect(Timeout.timeout(10) { threads.map(&:value).map(&:code) }).to eq(%w[200 200])
+        end
+      end
+    ensure
+      2.times { release << :done } if release
+      threads&.each { |thread| thread.join(1) }
+      upstream&.stop
+    end
+
+    it "paces a tunneled response until a paused HTTP client resumes reading in #{mode} mode" do
+      socket = nil
+      upstream = SystemHttpServer.new
+      mutex = Mutex.new
+      written = 0
+      chunk = 'x' * 32_768
+      total_bytes = chunk.bytesize * 512
+      upstream.on('/pressure') do |request|
+        request.socket.setsockopt(Socket::SOL_SOCKET, Socket::SO_SNDBUF, 32_768)
+        request.socket.write("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: #{total_bytes}\r\nConnection: close\r\n\r\n")
+        512.times do
+          request.socket.write(chunk)
+          mutex.synchronize { written += chunk.bytesize }
+        end
+        :handled
+      end
+
+      with_service_cluster(mode:, upstream_url: upstream.base_url, response_timeout: 15, stream_timeout: 15) do |cluster|
+        socket = TCPSocket.new('127.0.0.1', cluster.fetch(:requester).port)
+        socket.write("POST /pressure HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/octet-stream\r\nContent-Length: 1100000\r\n\r\n#{'x' * 1_100_000}")
+        last_written = 0
+        last_change = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+        paused_bytes = wait_until(timeout: 10, interval: 0.1) do
+          current = mutex.synchronize { written }
+          now = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+          last_change = now if current != last_written
+          last_written = current
+          current if current == total_bytes || (current.positive? && now - last_change >= 0.75)
+        end
+        expect(paused_bytes).to be < total_bytes
+
+        head, body = Timeout.timeout(15) { read_http_response(socket) }
+        expect(head).to include('200')
+        expect(body.bytesize).to eq(total_bytes)
+        expect(Digest::SHA256.hexdigest(body)).to eq(Digest::SHA256.hexdigest(chunk * 512))
+      end
+    ensure
+      socket&.close unless socket&.closed?
+      upstream&.stop
+    end
+
+    it "uses the TCP transport for large bodies and keeps small requests inline in #{mode} mode" do
+      upstream = SystemHttpServer.new
+      response_body = Random.new(42).bytes(1_200_000)
+      upstream.on('/large') do |request|
+        {
+          status: 201,
+          headers: { 'Content-Type' => 'application/octet-stream', 'X-Body-SHA256' => Digest::SHA256.hexdigest(request.body) },
+          body: [request.body.bytesize > 1_048_576 ? response_body : 'small']
+        }
+      end
+
+      with_service_cluster(mode:, upstream_url: upstream.base_url, response_timeout: 10, stream_timeout: 10) do |cluster|
+        bodies = ["{ \"image\": \"#{'A' * 1_200_000}\" }\n", Random.new(43).bytes(1_200_000), "field=#{'x' * 1_100_000}", '{"small":true}']
+        bodies.each_with_index do |body, index|
+          content_type = index == 2 ? 'application/x-www-form-urlencoded' : 'application/octet-stream'
+          response = http_request(
+            base_url: cluster.fetch(:requester_url), method: 'post', path: '/large?original=query', body:,
+            headers: { 'Content-Type' => content_type, 'Authorization' => 'Bearer test-token', 'traceparent' => '00-abc-xyz-01' }
+          )
+          expect(response.code).to eq('201'), response.body.to_s.byteslice(0, 500)
+          expect(response['x-body-sha256']).to eq(Digest::SHA256.hexdigest(body))
+          expected_body = body.bytesize > 1_048_576 ? response_body : 'small'
+          expect(Digest::SHA256.hexdigest(response.body)).to eq(Digest::SHA256.hexdigest(expected_body))
+        end
+        requests = upstream.requests
+        expect(requests.map(&:query)).to eq(['original=query'] * bodies.length)
+        expect(requests.map(&:body)).to eq(bodies)
+        expect(requests.map { |request| request.headers['authorization'] }).to eq(['Bearer test-token'] * bodies.length)
+        events = http_get_json(cluster.fetch(:requester_url), '/observability/flows?event_type=request_published&include_nats_payload=true&limit=10')
+        operations = events.fetch('events').map { |event| JSON.parse(event.fetch('nats_payload')).fetch('operation') }
+        expect(operations).to eq(%w[tcp_stream tcp_stream tcp_stream http_request])
+        runtime = http_get_json(cluster.fetch(:requester_url), '/observability/nats')
+        expect(runtime.dig('connection', 'server_info', 'max_payload')).to eq(1_048_576)
+        expect(runtime.dig('connection', 'connected')).to eq(true)
+      end
+    ensure
+      upstream&.stop
+    end
+
+    it "reports a missing receiver upstream without hanging in #{mode} mode" do
+      with_service_cluster(mode:, upstream_url: nil, response_timeout: 5, stream_timeout: 5) do |cluster|
+        ['{}', 'x' * 1_100_000].each do |body|
+          response = http_request(base_url: cluster.fetch(:requester_url), method: 'post', path: '/missing', body:)
+          expect(response.code).to eq('503'), "#{response.body}\nReceiver:\n#{cluster.fetch(:receiver).logs}\nRequester:\n#{cluster.fetch(:requester).logs}"
+          expect(response.body).to include('Receiver is missing UPSTREAM_URL')
+        end
+      end
+    end
+
+    it "cancels the tunneled upstream when a streaming HTTP client disconnects in #{mode} mode" do
+      socket = nil
+      upstream = SystemHttpServer.new
+      disconnects = Queue.new
+      upstream.on('/large-events') do |request|
+        request.socket.write("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n")
+        loop do
+          chunk = "data: #{'x' * 4096}\n\n"
+          request.socket.write("#{chunk.bytesize.to_s(16)}\r\n#{chunk}\r\n")
+          sleep 0.01
+        end
+      rescue IOError, Errno::ECONNRESET, Errno::EPIPE
+        disconnects << :closed
+        :handled
+      end
+      with_service_cluster(mode:, upstream_url: upstream.base_url, response_timeout: 5, stream_timeout: 5) do |cluster|
+        socket = open_http_socket(
+          host: '127.0.0.1', port: cluster.fetch(:requester).port,
+          request_text: "POST /large-events HTTP/1.1\r\nHost: localhost\r\nContent-Length: 1100000\r\n\r\n#{'x' * 1_100_000}"
+        )
+        expect(read_http_head(socket)).to include('200')
+        expect(socket.readpartial(8192)).to include('data: ')
+        socket.close
+        expect(wait_until(timeout: 8) { disconnects.pop(true) rescue nil }).to eq(:closed)
+      end
+    ensure
+      socket&.close unless socket&.closed?
+      upstream&.stop
+    end
+  end
+
+  include_examples "large HTTP requests", :core
+  include_examples "large HTTP requests", :jetstream
+
+  it "forwards a large absolute-form HTTPS request through the binary tunnel" do
+    socket = nil
+    key = OpenSSL::PKey::RSA.new(2048)
+    certificate = OpenSSL::X509::Certificate.new
+    certificate.subject = certificate.issuer = OpenSSL::X509::Name.parse('/CN=localhost')
+    certificate.public_key = key.public_key
+    certificate.not_before = Time.now - 60
+    certificate.not_after = Time.now + 3600
+    certificate.sign(key, OpenSSL::Digest.new('SHA256'))
+    ssl_context = OpenSSL::SSL::SSLContext.new
+    ssl_context.cert, ssl_context.key = certificate, key
+    upstream = SystemHttpServer.new(ssl_context:)
+    upstream.on('/secure') do |request|
+      { status: 201, headers: { 'Content-Type' => 'text/plain' }, body: [Digest::SHA256.hexdigest(request.body)] }
+    end
+    body = Random.new(44).bytes(1_100_000)
+    with_service_cluster(mode: :core, upstream_url: nil, response_timeout: 10, stream_timeout: 10) do |cluster|
+      socket = open_http_socket(
+        host: '127.0.0.1', port: cluster.fetch(:requester).port,
+        request_text: "POST #{upstream.base_url}/secure?source=proxy HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/octet-stream\r\nContent-Length: #{body.bytesize}\r\n\r\n#{body}"
+      )
+      head, response_body = read_http_response(socket)
+      expect(head).to include('201'), response_body
+      expect(response_body).to eq(Digest::SHA256.hexdigest(body))
+      expect(upstream.requests.map(&:query)).to eq(['source=proxy'])
+    end
+  ensure
+    socket&.close unless socket&.closed?
+    upstream&.stop
+  end
+
   it "proxies a non-streaming JSON request through core mode and exposes success in observability" do
     upstream = SystemHttpServer.new
     upstream.on("/api/echo") do |request|

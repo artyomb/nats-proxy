@@ -30,9 +30,7 @@ class TcpTunnelBridge
     @flow_initial_window_bytes = flow_initial_window_bytes.to_i
     @flow_credit_batch_bytes = flow_credit_batch_bytes.to_i
     @flow_credit_wait_timeout = (flow_credit_wait_timeout || stream_response_timeout).to_f
-    max_payload = nats_client.respond_to?(:max_payload) ? nats_client.max_payload.to_i : 1_048_576
-    max_payload = 1_048_576 if max_payload <= 0
-    @chunk_size = [max_payload / 2, DEFAULT_CHUNK_SIZE].min
+    @chunk_size = [[nats_client.max_payload / 2, 1].max, DEFAULT_CHUNK_SIZE].min
   end
 
   def dispatch_connect_request(env:)
@@ -149,14 +147,13 @@ class TcpTunnelBridge
     end
 
     bind_host, bind_port = local_bind_address(socket)
-    emit.call(
-      BridgeProtocol.session_established_event(
-        session_id: request_id,
-        bind_host: bind_host,
-        bind_port: bind_port,
-        ingress_kind: payload['ingress_kind']
-      )
+    established = BridgeProtocol.session_established_event(
+      session_id: request_id,
+      bind_host: bind_host,
+      bind_port: bind_port,
+      ingress_kind: payload['ingress_kind']
     )
+    emit.call(established)
     grant_initial_upstream_credit(request_id, requester_service_id)
     LOGGER.info "Session established: session_id=#{request_id}, target=#{host}:#{port}, backend=#{@nats_backend}"
 

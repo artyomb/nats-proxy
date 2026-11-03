@@ -60,6 +60,8 @@ RSpec.describe BridgeCore do
     end
 
     def subscribe(*) = 1
+    def check_payload_size!(*) = nil
+    def payload_fits?(*) = true
     def unsubscribe(*) = true
     def jetstream = raise "jetstream not expected"
   end
@@ -315,6 +317,19 @@ RSpec.describe BridgeCore do
     expect(msg.nak_count).to eq(1)
     expect(msg.ack_count).to eq(0)
     expect(msg.term_count).to eq(0)
+  end
+
+  it 'answers unsupported operations in JetStream without retrying a permanent refusal' do
+    client = FakeNatsClient.new
+    core = build_core(backend: :jetstream, nats_client: client)
+    data = BridgeProtocol.request_envelope(request_id: 'unsupported', reply_to: 'from.proxy.responses.requester.unsupported', operation: 'unsupported', payload: {})
+    msg = AckMessageDouble.new(data.to_json, {}, nil, 'to.proxy.requests.requester.unsupported')
+    Sync do
+      core.send(:run_request_job, { msg:, data:, manual_ack: true }, in_progress_interval: 0)
+    end
+    expect(msg.ack_count).to eq(1)
+    expect(msg.nak_count).to eq(0)
+    expect(decode_published_messages(client).first).to include('type' => 'response_start', 'status' => 503)
   end
 
   it "acks tcp_stream JetStream jobs immediately after session establishment and only once" do

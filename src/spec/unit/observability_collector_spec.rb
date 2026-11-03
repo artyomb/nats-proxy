@@ -18,11 +18,15 @@ RSpec.describe ObservabilityCollector do
 
   it "derives canceled and timeout outcomes" do
     collector.record_cancel_observed(request_id: "req-cancel", reason: "client_closed", source_service_id: "srv-2", subject: "to.proxy.cancel.receiver-1.req-cancel")
-    collector.record_response_event(request_id: "req-timeout", subject: "from.req-timeout", event: { "type" => "response_error", "error" => "Gateway Timeout" })
+    collector.record_response_event(request_id: "req-timeout", subject: "from.req-timeout", event: { "type" => "response_error", "error" => "Deadline exceeded", "outcome" => "timeout" })
 
     cancel_event = collector.flow_events("outcome" => "canceled").fetch(:events).find { |event| event[:request_id] == "req-cancel" }
     expect(cancel_event).to include(subject: "to.proxy.cancel.receiver-1.req-cancel")
     expect(collector.flow_events("outcome" => "timeout").fetch(:events).map { |event| event[:request_id] }).to include("req-timeout")
+    expect(collector.flow_cases('request_id' => 'req-timeout').fetch(:cases).first).to include(status: 'timed_out', outcome: 'timeout')
+    collector.record_response_event(request_id: 'req-error', subject: 'from.req-error', event: { 'type' => 'response_error', 'error' => 'Invalid timeout parameter', 'outcome' => 'upstream_error' })
+    collector.record_response_event(request_id: 'req-legacy', subject: 'from.req-legacy', event: { 'type' => 'response_error', 'error' => 'Gateway Timeout' })
+    expect(collector.flow_events('outcome' => 'error').fetch(:events).map { |event| event[:request_id] }).to include('req-error', 'req-legacy')
   end
 
   it "aggregates flow-control events in cases and metrics" do

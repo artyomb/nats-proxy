@@ -36,6 +36,17 @@ module BridgeProtocol
   class ProtocolError < StandardError; end
   class InvalidRequestError < ArgumentError; end
 
+  class PayloadTooLargeError < StandardError
+    attr_reader :size, :limit
+
+    def initialize(size:, limit:)
+      @size, @limit = size, limit
+      super("NATS message size #{size} bytes exceeds max_payload #{limit} bytes")
+    end
+  end
+
+  class PayloadLimitUnavailableError < StandardError; end
+
   class ResponseStreamError < StandardError
     attr_reader :event
 
@@ -87,8 +98,8 @@ module BridgeProtocol
     { 'type' => RESPONSE_END }
   end
 
-  def error_event(message)
-    { 'type' => RESPONSE_ERROR, 'error' => message.to_s }
+  def error_event(message, outcome: OUTCOME_UPSTREAM_ERROR)
+    { 'type' => RESPONSE_ERROR, 'error' => message.to_s, 'outcome' => outcome }
   end
 
   def session_established_event(session_id:, receiver_service_id: nil, flow_kind: nil, bind_host: nil, bind_port: nil, ingress_kind: nil)
@@ -205,11 +216,13 @@ module BridgeProtocol
 
       case event['type']
       when RESPONSE_CHUNK
-        body << chunk_body(event)
+        chunk = chunk_body(event)
+        body << chunk
+        yield chunk if block_given?
       when RESPONSE_END
         return body
       when RESPONSE_ERROR
-        raise ProtocolError, "Unexpected event #{RESPONSE_ERROR}"
+        raise ResponseStreamError, event
       else
         raise ProtocolError, "Unexpected event #{event['type']}"
       end

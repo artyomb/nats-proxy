@@ -2,3 +2,4 @@
 .bundle/
 coverage/
 spec/results/
+spec/bin/nats-server

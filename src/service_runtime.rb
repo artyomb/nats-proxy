@@ -81,12 +81,18 @@ class ServiceRuntime
     @backend = @nats_service.backend
 
     @core = build_core
-    @http_gateway = build_http_gateway
     @tcp_tunnel_bridge = build_tcp_tunnel_bridge
+    @http_gateway = build_http_gateway
     @socks5_server = build_socks5_server
 
     @core.register_handler('http_request', &@http_gateway.method(:handle_bridge_request))
-    @core.register_handler('tcp_stream', &@tcp_tunnel_bridge.method(:handle_stream_request))
+    @core.register_handler('tcp_stream') do |payload:, **options, &emit|
+      if payload['ingress_kind'] == 'http_gateway'
+        @http_gateway.handle_tunnel_request(payload:, **options, &emit)
+      else
+        @tcp_tunnel_bridge.handle_stream_request(payload:, **options, &emit)
+      end
+    end
 
     case @role.to_sym
     when :receiver
@@ -135,9 +141,11 @@ class ServiceRuntime
       service_id: @config.fetch(:service_id),
       nats_response_timeout: @config.fetch(:nats_response_timeout),
       stream_response_timeout: @config.fetch(:stream_response_timeout),
+      flow_chunk_size: flow_window_config.fetch(:flow_chunk_size),
       flow_initial_window_bytes: flow_window_config.fetch(:flow_initial_window_bytes),
       flow_credit_batch_bytes: flow_window_config.fetch(:flow_credit_batch_bytes),
-      flow_credit_wait_timeout: flow_window_config.fetch(:flow_credit_wait_timeout)
+      flow_credit_wait_timeout: flow_window_config.fetch(:flow_credit_wait_timeout),
+      tcp_tunnel_bridge: @tcp_tunnel_bridge
     )
   end
 
@@ -157,8 +165,7 @@ class ServiceRuntime
 
   def flow_window_config
     @flow_window_config ||= begin
-      chunk_size = [@nats_service.max_payload.to_i / 2, TcpTunnelBridge::DEFAULT_CHUNK_SIZE].min
-      chunk_size = TcpTunnelBridge::DEFAULT_CHUNK_SIZE if chunk_size <= 0
+      chunk_size = [[@nats_service.max_payload / 2, 1].max, TcpTunnelBridge::DEFAULT_CHUNK_SIZE].min
 
       {
         flow_chunk_size: chunk_size,

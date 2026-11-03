@@ -1,4 +1,5 @@
 require 'async'
+require 'async/limited_queue'
 require 'async/http/faraday'
 require 'faraday'
 require 'faraday/retry'
@@ -8,6 +9,7 @@ require 'uri'
 require_relative 'request_context'
 require_relative 'bridge_protocol'
 require_relative 'flow_credit_window'
+require_relative 'http_tunnel'
 
 class HttpGateway
   InvalidProxyTargetError = Class.new(ArgumentError)
@@ -34,19 +36,23 @@ class HttpGateway
     service_id:,
     nats_response_timeout:,
     stream_response_timeout:,
+    flow_chunk_size: 32_768,
     flow_initial_window_bytes: FlowCreditWindow.default_initial_bytes(chunk_size: 32_768),
     flow_credit_batch_bytes: FlowCreditWindow.default_batch_bytes(chunk_size: 32_768),
-    flow_credit_wait_timeout: nil
+    flow_credit_wait_timeout: nil,
+    tcp_tunnel_bridge: nil
   )
     @core = core
     @nats_backend = nats_backend
     @service_id = service_id
     @nats_response_timeout = nats_response_timeout
     @stream_response_timeout = stream_response_timeout
+    @flow_chunk_size = flow_chunk_size
     @flow_initial_window_bytes = flow_initial_window_bytes.to_i
     @flow_credit_batch_bytes = flow_credit_batch_bytes.to_i
     @flow_credit_wait_timeout = (flow_credit_wait_timeout || stream_response_timeout).to_f
     @upstream = build_upstream_connection(upstream_url)
+    @tcp_tunnel_bridge = tcp_tunnel_bridge
   end
 
   def receiver_capable? = !@upstream.nil?
@@ -68,14 +74,17 @@ class HttpGateway
     path = request_target(app.request)
     raw = request_body_for_method(app.request, method)
     headers = request_headers_from_env(app.request.env)
-    body = parse_request_body(raw.to_s)
+    body = raw
 
     context = if @core.bridge_outbound?
-      @core.bridge_request(
-        request_id: SecureRandom.hex(16),
-        operation: 'http_request',
-        payload: { 'method' => method, 'path' => path, 'headers' => headers, 'body' => body }
-      )
+      request_id = SecureRandom.hex(16)
+      payload = { 'method' => method, 'path' => path, 'headers' => headers, 'body' => body, 'response_flow_control' => true }
+      if @tcp_tunnel_bridge && !@core.bridge_request_fits?(request_id:, payload:)
+        LOGGER.info "Using HTTP over TCP tunnel: method=#{method}, path=#{path}"
+        tunneled_upstream_request(method:, path:, headers:, body: raw)
+      else
+        @core.bridge_request(request_id:, payload:)
+      end
     elsif receiver_capable?
       direct_upstream_request(method:, path:, headers:, body:)
     else
@@ -83,6 +92,26 @@ class HttpGateway
     end
 
     render_response(app:, context:)
+  rescue BridgeProtocol::PayloadTooLargeError => e
+    response_payload(status: 413, error: 'Payload Too Large', message: e.message)
+  rescue BridgeProtocol::PayloadLimitUnavailableError => e
+    service_unavailable_response(e.message)
+  end
+
+  def handle_tunnel_request(payload:, **options)
+    target, headers = http_tunnel_target(payload['path'])
+    @tcp_tunnel_bridge.handle_stream_request(
+      payload: payload.merge('host' => target.hostname, 'port' => target.port),
+      **options, detached: false
+    ) do |event|
+      event = event.merge('http_url' => target.to_s, 'http_headers' => headers) if event['type'] == BridgeProtocol::SESSION_ESTABLISHED
+      yield event
+    end
+  rescue BridgeProtocol::InvalidRequestError, BridgeProtocol::UpstreamUnavailableError => e
+    yield build_start_event(status: 503, headers: { 'content-type' => 'application/json' })
+    yield BridgeProtocol.chunk_event({ error: e.message }.to_json)
+    yield BridgeProtocol.end_event
+    BridgeProtocol::OUTCOME_UPSTREAM_ERROR
   end
 
   def handle_bridge_request(payload:, cancel_check:, emit_failure_response:, request_id: nil, response_credit_window: nil)
@@ -99,13 +128,10 @@ class HttpGateway
 
     unless upstream_connection
       error_message = 'Receiver is missing UPSTREAM_URL'
-      if emit_failure_response
-        yield build_start_event(status: 503, headers: { 'content-type' => 'application/json' })
-        yield BridgeProtocol.chunk_event({ error: error_message }.to_json)
-        yield BridgeProtocol.end_event
-        return BridgeProtocol::OUTCOME_UPSTREAM_ERROR
-      end
-      raise BridgeProtocol::UpstreamUnavailableError, error_message
+      yield build_start_event(status: 503, headers: { 'content-type' => 'application/json' })
+      yield BridgeProtocol.chunk_event({ error: error_message }.to_json)
+      yield BridgeProtocol.end_event
+      return BridgeProtocol::OUTCOME_UPSTREAM_ERROR
     end
 
     proxy_upstream_request(
@@ -117,22 +143,23 @@ class HttpGateway
       emit_failure_response:,
       cancel_check:,
       request_id:,
-      response_credit_window:
+      response_credit_window:,
+      buffered_response_credit: payload['response_flow_control'] == true
     ) { |event| yield event }
   rescue InvalidProxyTargetError => e
     raise BridgeProtocol::InvalidRequestError, e.message
   end
 
-  def proxy_upstream_request(connection:, method:, path:, headers: {}, body: nil, emit_failure_response: true, cancel_check: nil, request_id: nil, response_credit_window: nil)
+  def proxy_upstream_request(connection:, method:, path:, headers: {}, body: nil, emit_failure_response: true, cancel_check: nil, request_id: nil, response_credit_window: nil, buffered_response_credit: false)
     raise ArgumentError, 'block required' unless block_given?
 
-    state = { start_event: nil, streaming_started: false, buffered_chunks: [] }
+    state = { start_event: nil, response_started: false }
     request_headers = forwardable_request_headers(headers)
 
     response = connection.run_request(method.downcase.to_sym, path, nil, nil) do |req|
       request_headers.each { |key, value| req.headers[key] = value }
 
-      if body
+      unless body.nil?
         req.body = body.is_a?(String) ? body : body.to_json
         req.headers['content-type'] ||= 'application/json' unless body.is_a?(String)
       end
@@ -145,31 +172,22 @@ class HttpGateway
           headers: extract_headers(env)
         )
 
-        if state[:start_event]['streaming']
-          unless state[:streaming_started]
-            yield state[:start_event]
-            state[:streaming_started] = true
-          end
-          emit_stream_chunk(chunk, request_id:, response_credit_window:, cancel_check:) { |event| yield event } unless chunk.empty?
-        else
-          state[:buffered_chunks] << chunk unless chunk.empty?
+        unless state[:response_started]
+          yield state[:start_event]
+          state[:response_started] = true
         end
+        window = response_credit_window if state[:start_event]['streaming'] || buffered_response_credit
+        emit_stream_chunk(chunk, request_id:, response_credit_window: window, cancel_check:) { |event| yield event } unless chunk.empty?
       end
     end
 
     state[:start_event] ||= build_start_event(status: response.status, headers: response.headers)
 
-    unless state[:streaming_started]
+    unless state[:response_started]
       yield state[:start_event]
-
-      body_chunk =
-        if state[:buffered_chunks].empty?
-          response.body.to_s
-        else
-          state[:buffered_chunks].join
-        end
-
-      yield BridgeProtocol.chunk_event(body_chunk) unless body_chunk.empty?
+      state[:response_started] = true
+      window = response_credit_window if state[:start_event]['streaming'] || buffered_response_credit
+      emit_stream_chunk(response.body.to_s, request_id:, response_credit_window: window, cancel_check:) { |event| yield event }
     end
 
     yield BridgeProtocol.end_event
@@ -177,16 +195,17 @@ class HttpGateway
   rescue BridgeProtocol::StreamCanceledError
     BridgeProtocol::OUTCOME_CANCELED
   rescue BridgeProtocol::FlowCreditTimeoutError
-    if state[:streaming_started]
-      yield BridgeProtocol.error_event('Response flow credit timeout')
+    if state[:response_started]
+      yield BridgeProtocol.error_event('Response flow credit timeout', outcome: BridgeProtocol::OUTCOME_TIMEOUT)
       yield BridgeProtocol.end_event
     end
     BridgeProtocol::OUTCOME_TIMEOUT
   rescue Faraday::ConnectionFailed, Faraday::TimeoutError => e
     error_message = "Upstream unavailable: #{e.message}"
 
-    if state[:streaming_started]
-      yield BridgeProtocol.error_event(error_message)
+    if state[:response_started]
+      outcome = e.is_a?(Faraday::TimeoutError) ? BridgeProtocol::OUTCOME_TIMEOUT : BridgeProtocol::OUTCOME_UPSTREAM_ERROR
+      yield BridgeProtocol.error_event(error_message, outcome:)
       yield BridgeProtocol.end_event
     elsif emit_failure_response
       yield build_start_event(status: 503, headers: { 'content-type' => 'application/json' })
@@ -243,6 +262,15 @@ class HttpGateway
 
   private
 
+  def http_tunnel_target(path)
+    connection, target_path, = resolve_upstream_target(path, @upstream)
+    raise BridgeProtocol::UpstreamUnavailableError, 'Receiver is missing UPSTREAM_URL' unless connection
+
+    [connection.build_url(target_path), connection.headers.to_h]
+  rescue InvalidProxyTargetError => e
+    raise BridgeProtocol::InvalidRequestError, e.message
+  end
+
   def proxy_absolute_form?(value)
     value.to_s.match?(/\Ahttps?:\/\//i)
   end
@@ -285,10 +313,6 @@ class HttpGateway
     value = headers['content-type']
     value = value.first if value.is_a?(Array)
     value&.split(';', 2)&.first&.strip&.downcase
-  end
-
-  def parse_request_body(raw_body)
-    raw_body.empty? ? nil : (JSON.parse(raw_body) rescue raw_body)
   end
 
   def response_payload(status:, error:, message:)
@@ -387,7 +411,11 @@ class HttpGateway
   def request_body_for_method(request, method)
     return nil if %w[GET HEAD].include?(method)
 
-    request.body.read
+    input = request.body
+    return '' unless input
+
+    input.rewind if input.respond_to?(:rewind)
+    input.read
   end
 
   def direct_upstream_request(method:, path:, headers:, body:)
@@ -411,6 +439,41 @@ class HttpGateway
 
     context.worker = worker
     context
+  end
+
+  def tunneled_upstream_request(method:, path:, headers:, body:)
+    queue_size = [(@flow_initial_window_bytes.to_f / @flow_chunk_size).ceil, 1].max
+    context = RequestContext.new(request_id: SecureRandom.hex(16), response_queue: Async::LimitedQueue.new(queue_size))
+    context.worker = Async do
+      tunnel = HttpTunnel.new(
+        core: @core, tcp_bridge: @tcp_tunnel_bridge, request_id: context.request_id,
+        method:, path:, timeout: @nats_response_timeout
+      )
+      proxy_upstream_request(
+        connection: tunnel.connection, method:, path: tunnel.url, headers:, body:,
+        cancel_check: -> { context.cancel_requested? }
+      ) { |event| context.response_queue.push(event) }
+    rescue BridgeProtocol::PayloadTooLargeError => e
+      enqueue_local_error(context, status: 413, message: e.message)
+    rescue BridgeProtocol::PayloadLimitUnavailableError => e
+      enqueue_local_error(context, status: 503, message: e.message)
+    rescue HttpTunnel::Error => e
+      enqueue_local_error(context, status: e.status, message: e.message)
+    rescue Timeout::Error, Async::TimeoutError => e
+      enqueue_local_error(context, status: 504, message: e.message)
+    rescue => e
+      LOGGER.error "HTTP tunnel failed: #{e.class} - #{e.message}"
+      enqueue_local_error(context, status: 502, message: e.message)
+    ensure
+      tunnel&.close
+    end
+    context
+  end
+
+  def enqueue_local_error(context, status:, message:)
+    context.response_queue.push(build_start_event(status:, headers: { 'content-type' => 'application/json' }))
+    context.response_queue.push(BridgeProtocol.chunk_event({ error: message }.to_json))
+    context.response_queue.push(BridgeProtocol.end_event)
   end
 
   def cancel_context(context, reason:)
@@ -449,13 +512,13 @@ class HttpGateway
     end
 
     context.receiver_service_id = start_event['receiver_service_id']
+    grant_initial_response_credit(context)
 
     if start_event['streaming']
       context.mark_streaming!
       apply_response_start_event(app, start_event)
       stream_content_type = start_event['content_type']
       disconnect_reason = nil
-      grant_initial_response_credit(context)
 
       disconnect = lambda do |reason|
         next if disconnect_reason
@@ -492,7 +555,8 @@ class HttpGateway
           LOGGER.warn "Bridge stream timeout: request_id=#{context.request_id}, timeout=#{@stream_response_timeout}, backend=#{@nats_backend}"
           out << format_stream_error('Gateway Timeout', content_type: stream_content_type)
         when Hash
-          context.mark_terminal!(BridgeProtocol::OUTCOME_UPSTREAM_ERROR)
+          error_outcome = outcome['outcome'] || BridgeProtocol::OUTCOME_UPSTREAM_ERROR
+          context.mark_terminal!(error_outcome)
           LOGGER.warn "Bridge stream error: request_id=#{context.request_id}, error=#{outcome['error']}, backend=#{@nats_backend}"
           out << format_stream_error(outcome['error'], content_type: stream_content_type)
         else
@@ -511,7 +575,9 @@ class HttpGateway
         release_context(context)
       end
     else
-      response_body = BridgeProtocol.collect_non_streaming_body(context.response_queue, timeout: @stream_response_timeout)
+      response_body = BridgeProtocol.collect_non_streaming_body(context.response_queue, timeout: @stream_response_timeout) do |chunk|
+        return_response_credit(context, chunk.bytesize)
+      end
       unless response_body
         context.mark_terminal!(BridgeProtocol::OUTCOME_TIMEOUT)
         LOGGER.warn "Bridge body timeout: request_id=#{context.request_id}, timeout=#{@stream_response_timeout}, backend=#{@nats_backend}"
@@ -527,11 +593,13 @@ class HttpGateway
     LOGGER.error "Bridge protocol error: request_id=#{context&.request_id}, error=#{e.message}"
     gateway_protocol_error_response(e.message)
   rescue BridgeProtocol::ResponseStreamError => e
-    context.mark_terminal!(BridgeProtocol::OUTCOME_UPSTREAM_ERROR) if context
+    outcome = e.event['outcome'] || BridgeProtocol::OUTCOME_UPSTREAM_ERROR
+    context.mark_terminal!(outcome) if context
     LOGGER.error "Bridge response error: request_id=#{context&.request_id}, error=#{e.message}"
-    gateway_protocol_error_response(e.message)
+    outcome == BridgeProtocol::OUTCOME_TIMEOUT ? response_payload(status: 504, error: 'Gateway Timeout', message: e.message) : gateway_protocol_error_response(e.message)
   ensure
     unless start_event&.dig('streaming')
+      flush_response_credit(context) if context
       LOGGER.info "Request finalized: request_id=#{context&.request_id}, outcome=#{context&.outcome}, backend=#{@nats_backend}" if context
       release_context(context) if context
     end
@@ -542,15 +610,11 @@ class HttpGateway
   def extract_headers(env) = env.response_headers
 
   def emit_stream_chunk(chunk, request_id:, response_credit_window:, cancel_check:)
-    unless response_credit_window
-      yield BridgeProtocol.chunk_event(chunk)
-      return
-    end
-
     bytes = chunk.to_s.b
     offset = 0
     while offset < bytes.bytesize
-      reserved = reserve_response_credit(response_credit_window, request_id:, bytes: bytes.bytesize - offset, cancel_check:)
+      size = [bytes.bytesize - offset, @flow_chunk_size].min
+      reserved = response_credit_window ? reserve_response_credit(response_credit_window, request_id:, bytes: size, cancel_check:) : size
       raise BridgeProtocol::FlowCreditTimeoutError, 'response flow credit timeout' if reserved == FlowCreditWindow::TIMEOUT
       return unless reserved
 

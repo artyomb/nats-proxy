@@ -7,6 +7,10 @@ The bridge protocol is the message format used between the requester and receive
 
 HTTP work is JSON-framed. TCP tunnel data uses binary NATS frames after an initial JSON session open request.
 
+HTTP requests that do not fit in one NATS message automatically use the existing TCP session transport. The size check includes the serialized request envelope and NATS headers, using the connected server's `INFO.max_payload`. Small requests retain the `http_request` path. Bodies that cannot be represented as JSON also use the binary path.
+
+The gateway selects the transport with an explicit `bridge_request_fits?` check. A large body is a normal routing decision. `PayloadTooLargeError` is reserved for an actual attempt to publish an oversized message and is not used to switch transports.
+
 For code-level debugging, the main implementation is split between `BridgeProtocol` and `BridgeCore`:
 
 - `BridgeProtocol` builds and parses protocol objects.
@@ -17,9 +21,9 @@ For code-level debugging, the main implementation is split between `BridgeProtoc
 | Operation | Handler | Purpose |
 |---|---|---|
 | `http_request` | `HttpGateway#handle_bridge_request` | Forward an HTTP request to `UPSTREAM_URL` or to an absolute proxy target. |
-| `tcp_stream` | `TcpTunnelBridge#handle_stream_request` | Open a TCP connection for HTTP `CONNECT` or SOCKS5 and then exchange binary session frames. |
+| `tcp_stream` | `TcpTunnelBridge#handle_stream_request` | Open a TCP connection for HTTP `CONNECT`, SOCKS5, or an oversized HTTP request, then exchange binary session frames. |
 
-Handlers are registered in `ServiceRuntime#boot!`. If a receiver gets an unknown operation, Core NATS mode publishes a controlled error response; JetStream mode raises so the message can be retried or terminated by the consumer path.
+Handlers are registered in `ServiceRuntime#boot!`. If a receiver gets an unknown operation, both backends publish a terminal HTTP 503 response; JetStream acknowledges this permanent refusal without retrying it.
 
 ## Request Envelope
 
@@ -47,7 +51,19 @@ For HTTP requests, `payload.path` can be:
 - a normal origin-form path such as `/v1/models`, forwarded relative to `UPSTREAM_URL`;
 - an absolute HTTP URL such as `http://example.com/path`, used by HTTP proxy traffic.
 
-`HttpGateway` strips hop-by-hop request headers before forwarding. `GET` and `HEAD` do not send a request body. Other methods send the body as parsed JSON when possible, otherwise as a string.
+`HttpGateway` strips hop-by-hop request headers before forwarding. `GET` and `HEAD` do not send a request body. Other methods carry the original HTTP body as a string, preserving whitespace, JSON scalars and quoting. The receiver still accepts legacy parsed JSON bodies. Binary bodies that cannot be serialized in the envelope use the TCP tunnel.
+
+## Oversized HTTP Requests
+
+The fallback opens `tcp_stream` with `ingress_kind=http_gateway`, the original HTTP method and request target, and no body in the session-open envelope. `ServiceRuntime` routes this ingress to `HttpGateway#handle_tunnel_request`. The HTTP adapter resolves the target using the same `UPSTREAM_URL` or absolute-form URL rules as the JSON bridge, then delegates ready host/port values to `TcpTunnelBridge`. It enriches `session_established` with `http_url`, the resolved URL, and `http_headers`, the upstream connection's default headers, including URL-based Basic Auth. Client request headers override these defaults as on the JSON bridge. Diagnostic captures redact `http_headers`.
+
+On the requester, `HttpTunnel` connects Faraday's existing Async HTTP adapter to a local socket pair. The other end runs the same requester tunnel pump used by CONNECT/SOCKS5. Complete HTTP requests and responses, including TLS for HTTPS targets, cross NATS as existing binary session frames with existing byte-credit flow control. The HTTP library handles message framing; no new body-chunk protocol or end marker is required. Raw request bodies are preserved. The HTTP client performs one transport attempt, so an interrupted POST is not automatically replayed.
+
+The local HTTP response queue is bounded by the configured initial flow window and chunk size. A slow downstream client stops the HTTP adapter from reading more tunnel bytes, so existing TCP credits propagate backpressure to the upstream. The HTTP adapter requests inline execution through the TCP handler's existing `detached` option, retaining a `RECEIVER_MAX_INFLIGHT` slot until the HTTP tunnel finishes. CONNECT and SOCKS5 sessions keep their detached lifecycle. HTTP target resolution, HTTP metadata and permanent refusal responses stay in `HttpGateway`; the core and TCP transport do not branch on the HTTP ingress kind.
+
+Update requester and receiver together before relying on this fallback. The new ingress kind requires receiver-side target resolution; existing CONNECT/SOCKS5 frames and operations remain compatible. A receiver without this support rejects the session instead of forwarding an empty HTTP request. An oversized session-open envelope is rejected with HTTP 413 containing the actual NATS message size and limit. Connection failures and establishment timeouts return diagnostic gateway errors.
+
+The NATS limit is per message, not per HTTP body or flow-credit window. Each broker on a leafnode route must accept the selected frame size; local `INFO.max_payload` does not describe every intermediate broker. Request bodies are still buffered by the HTTP gateway before routing, as on the existing JSON path.
 
 ## Response Events
 
@@ -57,10 +73,14 @@ HTTP responses are returned as ordered JSON events on `reply_to`.
 |---|---|
 | `response_start` | HTTP `status`, normalized response `headers`, `content_type`, `streaming`, and owner metadata such as `receiver_service_id`, `request_id`, and `flow_kind`. |
 | `response_chunk` | `body` for valid UTF-8 chunks, or `body_encoding=base64` and `body_base64` for binary chunks. |
-| `response_error` | `error` string for stream failures or cancellation diagnostics. |
+| `response_error` | `error` string plus an explicit `outcome` (`upstream_error`, `timeout`, or `canceled`). |
 | `response_end` | Terminal marker for the HTTP response. |
 
 `text/event-stream` and `application/x-ndjson` responses are treated as streaming. Other responses are buffered until `response_end`, then returned as a normal Rack response body.
+
+The receiver sends every HTTP response as bounded chunks without first buffering its complete body. `BridgeCore` additionally splits a response chunk if its serialized UTF-8/base64 representation plus NATS headers would exceed `max_payload`. For ordinary responses, a requester advertises `payload.response_flow_control=true`; the receiver then uses the existing response credit window, and the requester returns credit as it collects chunks. Receivers continue to support legacy requesters that omit this flag. Streaming responses retain their existing credit behavior.
+
+Error classification uses the explicit `outcome`, never the wording of `error`. Events from older peers without an outcome are classified as generic errors. Missing `UPSTREAM_URL` and unsupported operations produce a terminal HTTP 503 response in both Core and JetStream, so those permanent refusals are acknowledged instead of retried. An unavailable or invalid `INFO.max_payload` stops publication with a diagnostic error; the proxy does not substitute an assumed limit.
 
 ## Owner Metadata
 
@@ -85,15 +105,15 @@ sequenceDiagram
   Req->>NATS: request envelope with reply_to
   NATS->>Rec: http_request
   Rec->>Up: forwarded HTTP request
-  Up-->>Rec: complete HTTP response
+  Up-->>Rec: HTTP response headers and body chunks
   Rec-->>NATS: response_start(streaming=false)
-  Rec-->>NATS: response_chunk
+  Rec-->>NATS: bounded response_chunk events
   Rec-->>NATS: response_end
   NATS-->>Req: response events
   Req-->>Client: HTTP response
 ```
 
-`BridgeProtocol.wait_for_start_event` waits up to `NATS_RESPONSE_TIMEOUT` for `response_start`. `BridgeProtocol.collect_non_streaming_body` then waits up to `STREAM_RESPONSE_TIMEOUT` for chunks and `response_end`.
+`BridgeProtocol.wait_for_start_event` waits up to `NATS_RESPONSE_TIMEOUT` for `response_start`. `BridgeProtocol.collect_non_streaming_body` then waits up to `STREAM_RESPONSE_TIMEOUT` for chunks and `response_end`, returning byte credit as it accumulates the ordinary response. A structured response error produces HTTP 502 or 504 instead of losing its diagnostic message.
 
 ## Streaming Response
 

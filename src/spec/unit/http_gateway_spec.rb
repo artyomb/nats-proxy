@@ -39,6 +39,48 @@ RSpec.describe HttpGateway do
     instance_double("BridgeCore", bridge_outbound?: false, bridge_request: nil, release_pending: nil, cancel_request: true, send_response_credit: nil)
   end
 
+  it "returns a diagnostic 413 when the request cannot fit the NATS transport" do
+    allow(core).to receive(:bridge_outbound?).and_return(true)
+    allow(core).to receive(:bridge_request).and_raise(BridgeProtocol::PayloadTooLargeError.new(size: 5000, limit: 4096))
+    gateway = described_class.new(
+      core:, upstream_url: nil, nats_backend: :core, service_id: 'srv-test',
+      nats_response_timeout: 1, stream_response_timeout: 1
+    )
+    app = FakeRackApp.new(request: FakeRackRequest.new(method: 'POST', path: '/large', body: 'data'))
+    status, _, body = gateway.dispatch_http_request(app:, method: 'POST')
+    expect(status).to eq(413)
+    expect(JSON.parse(body.join)).to include('error' => 'Payload Too Large', 'message' => 'NATS message size 5000 bytes exceeds max_payload 4096 bytes')
+  end
+
+  it 'returns 503 when the broker payload limit cannot be determined' do
+    allow(core).to receive(:bridge_outbound?).and_return(true)
+    allow(core).to receive(:bridge_request).and_raise(BridgeProtocol::PayloadLimitUnavailableError, 'NATS max_payload is unavailable')
+    gateway = described_class.new(core:, upstream_url: nil, nats_backend: :core, service_id: 'srv-test', nats_response_timeout: 1, stream_response_timeout: 1)
+    app = FakeRackApp.new(request: FakeRackRequest.new(method: 'POST', path: '/request', body: 'data'))
+    status, _, body = gateway.dispatch_http_request(app:, method: 'POST')
+    expect(status).to eq(503)
+    expect(JSON.parse(body.join)).to include('message' => 'NATS max_payload is unavailable')
+  end
+
+  it 'accepts a legacy parsed body without waiting for unadvertised ordinary-response credit' do
+    upstream = SystemHttpServer.new
+    upstream.on('/legacy') { |_request| { body: ['ok'] } }
+    gateway = described_class.new(core:, upstream_url: upstream.base_url, nats_backend: :core, service_id: 'receiver', nats_response_timeout: 1, stream_response_timeout: 0.05)
+    window = FlowCreditWindow.new(max_bytes: 1024)
+    events = []
+    outcome = Sync do
+      gateway.handle_bridge_request(
+        payload: { 'method' => 'POST', 'path' => '/legacy', 'body' => false },
+        cancel_check: -> { false }, emit_failure_response: true, response_credit_window: window
+      ) { |event| events << event }
+    end
+    expect(outcome).to eq(BridgeProtocol::OUTCOME_COMPLETED)
+    expect(upstream.requests.map(&:body)).to eq(['false'])
+    expect(events.select { |event| event['type'] == 'response_chunk' }.map { |event| BridgeProtocol.chunk_body(event) }.join).to eq('ok')
+  ensure
+    upstream&.stop
+  end
+
   it "uses direct upstream when bridge listener is absent and upstream is configured" do
     gateway = described_class.new(
       core: core,

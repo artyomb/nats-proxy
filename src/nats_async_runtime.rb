@@ -1,9 +1,9 @@
 require 'json'
 require 'nats-async'
+require_relative 'bridge_protocol'
 
 class NatsAsyncRuntime
   BACKEND_MODES = %i[auto core jetstream].freeze
-  DEFAULT_MAX_PAYLOAD = 1_048_576
   DEFAULT_JS_API_PREFIX = '$JS.API'.freeze
 
   attr_reader :backend_mode, :backend, :boot_error, :client
@@ -61,6 +61,7 @@ class NatsAsyncRuntime
 
     payload = serialize_message(message)
     merged_headers = merge_headers(headers)
+    check_payload_size!(payload, headers: merged_headers)
     return @client.publish(subject, payload, reply:, headers: merged_headers) if raw
 
     @client.jetstream.publish(subject, payload, headers: merged_headers)
@@ -85,15 +86,46 @@ class NatsAsyncRuntime
     ensure_ready!
 
     value = @client.server_info&.dig(:max_payload)
-    value.to_i.positive? ? value.to_i : DEFAULT_MAX_PAYLOAD
-  rescue
-    DEFAULT_MAX_PAYLOAD
+    return value if value.is_a?(Integer) && value.positive?
+
+    raise BridgeProtocol::PayloadLimitUnavailableError, 'NATS server did not advertise a valid max_payload'
+  rescue BridgeProtocol::PayloadLimitUnavailableError
+    raise
+  rescue => e
+    raise BridgeProtocol::PayloadLimitUnavailableError, "Unable to read NATS max_payload: #{e.class} - #{e.message}"
+  end
+
+  def payload_size(message, headers: nil)
+    size = serialize_message(message).bytesize
+    merged_headers = merge_headers(headers)
+    unless merged_headers.nil? || merged_headers.empty?
+      size += "NATS/1.0\r\n\r\n".bytesize
+      merged_headers.each do |key, value|
+        Array(value).each { |item| size += "#{key}: #{item}\r\n".bytesize }
+      end
+    end
+    size
+  end
+
+  def payload_fits?(message, headers: nil)
+    limit = max_payload
+    payload_size(message, headers:) <= limit
+  rescue JSON::GeneratorError
+    false
+  end
+
+  def check_payload_size!(message, headers: nil)
+    size = payload_size(message, headers:)
+    limit = max_payload
+    raise BridgeProtocol::PayloadTooLargeError.new(size:, limit:) if size > limit
+
+    size
   end
 
   def connection_snapshot
     return closed_snapshot unless @client
 
-    {
+    snapshot = {
       status: @client.status,
       connected: @client.connected?,
       disconnected: !@client.closed? && !@client.connected?,
@@ -103,11 +135,11 @@ class NatsAsyncRuntime
       server_info: @client.server_info,
       sent_pings: @client.sent_pings,
       received_pings: @client.received_pings,
-      received_pongs: @client.received_pongs,
-      max_payload: max_payload
+      received_pongs: @client.received_pongs
     }
+    snapshot.merge(max_payload: max_payload)
   rescue => e
-    closed_snapshot.merge(last_error: e)
+    (snapshot || closed_snapshot).merge(max_payload: nil, last_error: e)
   end
 
   def jetstream_info(stream:, consumer:)
@@ -167,7 +199,7 @@ class NatsAsyncRuntime
       sent_pings: 0,
       received_pings: 0,
       received_pongs: 0,
-      max_payload: DEFAULT_MAX_PAYLOAD
+      max_payload: nil
     }
   end
 end

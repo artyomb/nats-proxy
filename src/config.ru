@@ -5,6 +5,7 @@ require 'json'
 require 'securerandom'
 require 'sinatra'
 require 'stack-service-base'
+require 'rack/rewindable_input'
 require_relative 'protocol_rack_connect_patch'
 require_relative 'nats_async_runtime'
 require_relative 'observability_collector'
@@ -140,6 +141,22 @@ class ConnectProxyMiddleware
   end
 end
 
+class RewindableRequestBodyMiddleware
+  def initialize(app)
+    @app = app
+  end
+
+  def call(env)
+    if input = env['rack.input']
+      buffered = Rack::RewindableInput.new(input)
+      env['rack.input'] = buffered
+    end
+    @app.call(env)
+  ensure
+    buffered&.close
+  end
+end
+
 helpers do
   def runtime = SERVICE_RUNTIME
 
@@ -148,6 +165,7 @@ helpers do
   def runtime_unavailable_response = RuntimeResponses.service_unavailable
 end
 
+use RewindableRequestBodyMiddleware
 use ProxyAuthMiddleware,
     proxy_auth: PROXY_AUTH,
     gateway_resolver: -> { SERVICE_RUNTIME.http_gateway },
