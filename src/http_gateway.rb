@@ -16,6 +16,7 @@ class HttpGateway
 
   DownstreamDisconnectedError = Class.new(StandardError)
 
+  HTTP_READ_TIMEOUT = 300
   STREAMING_MEDIA_TYPES = %w[text/event-stream application/x-ndjson].freeze
   HOP_BY_HOP_HEADERS = %w[
     connection
@@ -202,7 +203,8 @@ class HttpGateway
     BridgeProtocol::OUTCOME_TIMEOUT
   rescue Faraday::ConnectionFailed, Faraday::TimeoutError => e
     error_message = "Upstream unavailable: #{e.message}"
-    outcome = e.is_a?(Faraday::TimeoutError) ? BridgeProtocol::OUTCOME_TIMEOUT : BridgeProtocol::OUTCOME_UPSTREAM_ERROR
+    timed_out = e.is_a?(Faraday::TimeoutError) || e.wrapped_exception.is_a?(IO::TimeoutError)
+    outcome = timed_out ? BridgeProtocol::OUTCOME_TIMEOUT : BridgeProtocol::OUTCOME_UPSTREAM_ERROR
 
     if state[:response_started]
       yield BridgeProtocol.error_event(error_message, outcome:)
@@ -291,8 +293,7 @@ class HttpGateway
 
     Faraday.new(url) do |f|
       f.request :retry, max: 2, interval: 0.2, backoff_factor: 2
-      f.options.timeout = 300
-      f.adapter :async_http
+      f.adapter :async_http, read_timeout: HTTP_READ_TIMEOUT
     end
   end
 
@@ -447,7 +448,7 @@ class HttpGateway
     context.worker = Async do
       tunnel = HttpTunnel.new(
         core: @core, tcp_bridge: @tcp_tunnel_bridge, request_id: context.request_id,
-        method:, path:, timeout: @nats_response_timeout
+        method:, path:, timeout: @nats_response_timeout, read_timeout: HTTP_READ_TIMEOUT
       )
       outcome = proxy_upstream_request(
         connection: tunnel.connection, method:, path: tunnel.url, headers:, body:,

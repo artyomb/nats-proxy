@@ -46,6 +46,8 @@ This page lists environment variables read by the Ruby app, Docker runtime image
 | `STREAM_RESPONSE_TIMEOUT` | `30` | both | No | Timeout for waiting on streaming response events and for flow-credit waits in HTTP streams and TCP tunnels. Idle TCP tunnels are not closed only because no data frames arrive. | `30` |
 | `RECEIVER_MAX_INFLIGHT` | `20` | receiver | No | Receiver dispatch concurrency. Internal queue size is twice this value. | `20` |
 
+HTTP forwarding has no fixed total-duration limit. Native HTTP socket I/O waits use the hardcoded `HttpGateway::HTTP_READ_TIMEOUT` of 300 seconds for both transports, independently of the environment variables above. Receiving data allows the next read to wait again. `NATS_RESPONSE_TIMEOUT` still limits the first response event or tunnel establishment, and response-event and flow-credit waits retain their existing limits. A model that sends no data can still time out; a live connection alone does not extend an I/O wait.
+
 ## Proxy And SOCKS5 Ingress
 
 | Variable | Default | Applies to | Required when | Description | Example |

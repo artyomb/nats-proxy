@@ -26,7 +26,7 @@ class HttpTunnel
 
   attr_reader :connection, :url
 
-  def initialize(core:, tcp_bridge:, request_id:, method:, path:, timeout:)
+  def initialize(core:, tcp_bridge:, request_id:, method:, path:, timeout:, read_timeout:)
     @core = core
     @context = core.bridge_session_open(
       session_id: request_id,
@@ -47,12 +47,12 @@ class HttpTunnel
     @url = event.fetch('http_url')
     core.send_session_credit_downstream(request_id, @context.receiver_service_id, core.flow_initial_window_bytes)
     @client_io, @tunnel_io = Socket.pair(:UNIX, :STREAM, 0)
+    @client_io.timeout = read_timeout
     @pump = Async { tcp_bridge.run_requester_tunnel(io: @tunnel_io, context: @context, session_id: request_id) }
 
     transport = IO::Endpoint::ConnectedEndpoint.new(nil, @client_io)
-    endpoint = Async::HTTP::Endpoint.parse(url, transport, protocol: Async::HTTP::Protocol::HTTP1)
+    endpoint = Async::HTTP::Endpoint.parse(url, transport, protocol: Async::HTTP::Protocol::HTTP1, timeout: read_timeout)
     @connection = Faraday.new(url:, headers: event['http_headers'] || {}) do |f|
-      f.options.timeout = 300
       f.adapter :async_http, clients: ->(**options) { Clients.new(endpoint, **options) }, retries: 1
     end
   rescue Exception

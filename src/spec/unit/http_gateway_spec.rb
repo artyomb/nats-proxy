@@ -81,6 +81,37 @@ RSpec.describe HttpGateway do
     upstream&.stop
   end
 
+  { 'active' => 0.05, 'idle' => 0.4 }.each do |state, pause|
+    it "handles an #{state} upstream with the native read timeout" do
+      stub_const('HttpGateway::HTTP_READ_TIMEOUT', 0.2)
+      upstream = SystemHttpServer.new
+      upstream.on('/response') do |request|
+        request.socket.write("HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\n")
+        6.times do
+          request.socket.write('x')
+          sleep pause
+        end
+        :handled
+      end
+      gateway = described_class.new(core:, upstream_url: upstream.base_url, nats_backend: :core, service_id: 'receiver', nats_response_timeout: 1, stream_response_timeout: 10)
+      events = []
+      outcome = Sync do |task|
+        task.with_timeout(2, RuntimeError, 'The native read timeout did not finish the request') do
+          gateway.handle_bridge_request(payload: { 'method' => 'POST', 'path' => '/response' }, cancel_check: -> { false }, emit_failure_response: true) { |event| events << event }
+        end
+      end
+      if state == 'active'
+        expect(outcome).to eq(BridgeProtocol::OUTCOME_COMPLETED)
+        expect(events.select { |event| event['type'] == 'response_chunk' }.map { |event| BridgeProtocol.chunk_body(event) }.join).to eq('xxxxxx')
+      else
+        expect(outcome).to eq(BridgeProtocol::OUTCOME_TIMEOUT)
+        expect(events.find { |event| event['type'] == 'response_error' }).to include('outcome' => BridgeProtocol::OUTCOME_TIMEOUT)
+      end
+    ensure
+      upstream&.stop
+    end
+  end
+
   it "uses direct upstream when bridge listener is absent and upstream is configured" do
     gateway = described_class.new(
       core: core,
