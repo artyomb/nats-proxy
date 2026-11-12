@@ -1,4 +1,12 @@
-on: { push: { branches: [main,release,dev] } }
+on:
+  push:
+    branches: [main,release,dev]
+  workflow_dispatch:
+    inputs:
+      skip_trivy:
+        description: Skip Trivy scan
+        type: boolean
+        default: false
 
 jobs:
   build_service_images:
@@ -20,6 +28,7 @@ jobs:
       - run: docker buildx bake -f bake.yml --set '*.output=type=docker' --sbom=false --provenance=false --metadata-file /tmp/bake-metadata.json
         working-directory: docker
       - run: trivy-runner -f bake.yml --metadata-file /tmp/bake-metadata.json -- --severity HIGH,CRITICAL --ignore-unfixed --table-mode detailed
+        if: ${{ inputs.skip_trivy != true }}
         working-directory: docker
       - run: docker compose -f bake.yml push
         working-directory: docker
